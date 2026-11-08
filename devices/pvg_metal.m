@@ -417,6 +417,37 @@ static void hv_dump_failed_library(NSData *lib, uint32_t task, uint64_t function
             binary_path.UTF8String, (unsigned long)lib.length);
 }
 
+/* Diagnostic compatibility test: retry a rejected macOS 15 metallib with
+   only its outer container header retargeted to iOS 17 / metallib 2.7.
+   The AIR bitcode and function metadata are deliberately left untouched,
+   so this separates an outer platform/container rejection from an AIR-version
+   or shader-body incompatibility. */
+static id<MTLLibrary> hv_try_ios17_header_retarget(id<MTLDevice> device, NSData *source, NSError **out_error) {
+    if (source.length < 88 || memcmp(source.bytes, "MTLB", 4) != 0) return nil;
+
+    NSMutableData *candidate = [source mutableCopy];
+    uint8_t *bytes = (uint8_t *)candidate.mutableBytes;
+
+    /* Target platform: iOS (0x0001); metallib container: 2.7; target OS: iOS 17.0. */
+    bytes[4] = 0x01;
+    bytes[5] = 0x00;
+    bytes[6] = 0x02;
+    bytes[7] = 0x00;
+    bytes[8] = 0x07;
+    bytes[9] = 0x00;
+    bytes[11] = 0x82;
+    bytes[12] = 17;
+    bytes[13] = 0;
+    bytes[14] = 0;
+    bytes[15] = 0;
+
+    dispatch_data_t data = dispatch_data_create(candidate.bytes, candidate.length, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+    NSError *error = nil;
+    id<MTLLibrary> library = [device newLibraryWithData:data error:&error];
+    if (!library && out_error) *out_error = error;
+    return library;
+}
+
 @implementation HvReplay
 
 - (void)complain:(NSString *)what {
@@ -452,9 +483,16 @@ static void hv_dump_failed_library(NSData *lib, uint32_t task, uint64_t function
     NSError *err = nil;
     id<MTLLibrary> library = [device newLibraryWithData:data error:&err];
     if (!library) {
-        hv_dump_failed_library(lib, task, at, h.off, err);
-        [self complain:[NSString stringWithFormat:@"library: %@", err.localizedDescription]];
-        return nil;
+        NSError *retarget_error = nil;
+        library = hv_try_ios17_header_retarget(device, lib, &retarget_error);
+        if (!library) {
+            hv_dump_failed_library(lib, task, at, h.off, err);
+            [self complain:[NSString stringWithFormat:@"library: %@; iOS 17 header retarget (2.7): %@",
+                            err.localizedDescription ?: @"unknown",
+                            retarget_error.localizedDescription ?: @"not attempted"]];
+            return nil;
+        }
+        [self complain:@"library: loaded after iOS 17 header retarget (2.7); AIR payload unchanged"];
     }
     {   /* m4 fork: while tracing, keep each library macOS sends, to read its shaders on a Mac */
         const char *tf = getenv("HV_PVG_TRACE_FILE");
