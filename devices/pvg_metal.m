@@ -365,6 +365,58 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
 }
 @end
 
+/* Save the exact guest metallib bytes when this host Metal runtime rejects them.
+   This is deliberately separate from HV_PVG_TRACE_FILE: no trace marker or
+   verbose command logging is needed. Files are written into the app's Documents
+   directory so they can be copied out with Files. */
+static _Atomic unsigned hv_failed_library_dump_count = 0;
+
+static void hv_dump_failed_library(NSData *lib, uint32_t task, uint64_t function_ref_address,
+                                   uint64_t guest_library_offset, NSError *metal_error) {
+    const unsigned index = atomic_fetch_add_explicit(&hv_failed_library_dump_count, 1, memory_order_relaxed);
+    if (index >= 64) {
+        if (index == 64) fprintf(stderr, "hengevm: pvg-metal: failed library dump limit reached (64)\n");
+        return;
+    }
+    if (!lib.length || lib.length > 128ull * 1024 * 1024) {
+        fprintf(stderr, "hengevm: pvg-metal: failed library dump skipped: invalid size %lu\n", (unsigned long)lib.length);
+        return;
+    }
+
+    NSString *directory = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/HengeMetalFailedLibraries"];
+    NSFileManager *manager = [NSFileManager defaultManager];
+    NSError *directory_error = nil;
+    if (![manager createDirectoryAtPath:directory withIntermediateDirectories:YES attributes:nil error:&directory_error]) {
+        fprintf(stderr, "hengevm: pvg-metal: cannot create dump directory: %s\n",
+                directory_error.localizedDescription.UTF8String ?: "unknown");
+        return;
+    }
+
+    NSString *base = [NSString stringWithFormat:@"failed-%02u-task-%u-ref-%llx-off-%llx",
+                      index + 1, task, (unsigned long long)function_ref_address,
+                      (unsigned long long)guest_library_offset];
+    NSString *binary_path = [directory stringByAppendingPathComponent:[base stringByAppendingString:@".metallib"]];
+    NSError *write_error = nil;
+    if (![lib writeToFile:binary_path options:NSDataWritingAtomic error:&write_error]) {
+        fprintf(stderr, "hengevm: pvg-metal: cannot write failed library dump: %s\n",
+                write_error.localizedDescription.UTF8String ?: "unknown");
+        return;
+    }
+
+    NSString *metadata = [NSString stringWithFormat:
+        @"task=%u\nfunction_ref_address=0x%llx\nguest_library_offset=0x%llx\nlength=%lu\nmetal_error=%@\n",
+        task, (unsigned long long)function_ref_address, (unsigned long long)guest_library_offset,
+        (unsigned long)lib.length, metal_error.localizedDescription ?: @"unknown"];
+    NSString *metadata_path = [directory stringByAppendingPathComponent:[base stringByAppendingString:@".txt"]];
+    NSError *metadata_error = nil;
+    if (![metadata writeToFile:metadata_path atomically:YES encoding:NSUTF8StringEncoding error:&metadata_error]) {
+        fprintf(stderr, "hengevm: pvg-metal: library saved but metadata write failed: %s\n",
+                metadata_error.localizedDescription.UTF8String ?: "unknown");
+    }
+    fprintf(stderr, "hengevm: pvg-metal: saved rejected metallib %s (%lu bytes)\n",
+            binary_path.UTF8String, (unsigned long)lib.length);
+}
+
 @implementation HvReplay
 
 - (void)complain:(NSString *)what {
@@ -400,6 +452,7 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
     NSError *err = nil;
     id<MTLLibrary> library = [device newLibraryWithData:data error:&err];
     if (!library) {
+        hv_dump_failed_library(lib, task, at, h.off, err);
         [self complain:[NSString stringWithFormat:@"library: %@", err.localizedDescription]];
         return nil;
     }
