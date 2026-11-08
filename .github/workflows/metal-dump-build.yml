@@ -1,0 +1,60 @@
+name: Build Henge Metal dump TIPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - work/metal-failed-metallib-dump
+
+permissions:
+  contents: read
+
+jobs:
+  build-tipa:
+    name: Build TrollStore package (Xcode 27)
+    runs-on: xcode-27
+    timeout-minutes: 120
+    env:
+      BITRISE_SOURCE_DIR: ${{ github.workspace }}
+      BITRISE_DEPLOY_DIR: ${{ github.workspace }}/artifacts
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Verify toolchain
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcode-select -p
+          mkdir -p "$BITRISE_DEPLOY_DIR" "$HOME/Desktop"
+
+      - name: Build Henge dependencies and IPA
+        run: bash ci/build-bitrise.sh
+
+      - name: Package TrollStore TIPA
+        run: |
+          set -euo pipefail
+          ./ios/scripts/package_ipa.sh --trollstore
+          test -s "$HOME/Desktop/Henge.tipa"
+          cp "$HOME/Desktop/Henge.tipa" "$BITRISE_DEPLOY_DIR/Henge-Metal-Dump.tipa"
+          cp "$HOME/Desktop/Henge.ipa" "$BITRISE_DEPLOY_DIR/Henge-Unsigned.ipa"
+
+      - name: Upload installable packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: Henge-Metal-Dump-TIPA
+          path: |
+            artifacts/Henge-Metal-Dump.tipa
+            artifacts/Henge-Unsigned.ipa
+            artifacts/Henge-color-fix-unsigned.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Henge-Metal-Dump-Build-Log
+          path: ios/build/DerivedData.buildlog
+          if-no-files-found: warn
+          retention-days: 7
