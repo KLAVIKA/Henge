@@ -902,7 +902,7 @@ static void sync_iosurface(HvObject *s, HvSyncTiming *timing) {
             hashes[i] = hash_bytes(from + s->plane_from[i], plane_bytes(s, i));
             if (hashes[i] != s->plane_hash[i]) changed |= 1u << i;
         }
-            if (!changed) {
+        if (!changed) {
             if (timing) timing->hash += now_seconds() - phase;
             return;
         }
@@ -942,6 +942,7 @@ static void sync_iosurface(HvObject *s, HvSyncTiming *timing) {
             fclose(f);
         }
     }
+    phase = now_seconds();
     if (by_plane) {
         /* IOSurface can choose different offsets and row strides from those
            requested. Copy each changed video plane through its actual host layout. */
@@ -2179,7 +2180,7 @@ typedef struct {
         p += 8;
         if ((info & 0xff) == 5) { /* protection options, then the real header */
             p += 8;
-            if (p + 8 > end) continue;
+            if (p + 8 > end) { command_parse_ms += (now_seconds() - parse_start) * 1000.0; continue; }
             memcpy(&seglen, p, 4), memcpy(&info, p + 4, 4);
             p += 8;
         }
@@ -2199,8 +2200,12 @@ typedef struct {
             command_parse_ms += (now_seconds() - parse_start) * 1000.0;
             continue;
         }
-        if (!e && type == 1) e = [cb computeCommandEncoder], pipeline_set = NO;
-        if (!e && type == 2) e = [cb blitCommandEncoder];
+        if (!e && (type == 1 || type == 2)) {
+            double encoder_start = now_seconds();
+            if (type == 1) e = [cb computeCommandEncoder], pipeline_set = NO;
+            else e = [cb blitCommandEncoder];
+            encoder_seconds += now_seconds() - encoder_start;
+        }
         etype = type;
         @try {
             while (p + 8 <= end) {
@@ -2216,7 +2221,9 @@ typedef struct {
                     else if (tag == 33 || tag == 32) [self complain:[NSString stringWithFormat:@"pass description %u (%u bytes) not done", tag, size]];
                 } else if (etype == 0 && tag == 26) {
                     if (e) [e endEncoding];
+                    double encoder_start = now_seconds();
                     e = [self beginPass:r task:task commandBuffer:cb];
+                    encoder_seconds += now_seconds() - encoder_start;
                     pipeline_set = NO, tess_factors = NO;
                 } else if (e) {
                     double encoder_start = now_seconds();
