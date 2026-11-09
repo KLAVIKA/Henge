@@ -28,6 +28,9 @@ jobs:
           xcode-select -p
           mkdir -p "$BITRISE_DEPLOY_DIR" "$HOME/Desktop"
 
+      - name: Test AIR bitcode triple relabelling
+        run: bash ci/test-metallib-relabel.sh
+
       - name: Build Henge dependencies and IPA
         run: bash ci/build-bitrise.sh
 
