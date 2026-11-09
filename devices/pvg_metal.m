@@ -143,14 +143,17 @@ enum { OBJ_BUFFER = 1, OBJ_TEXTURE = 2, OBJ_FUNCTION = 6, OBJ_SERIALIZED = 7, OB
     _Atomic int inflight;
     _Atomic int queued_work, max_queued_work;
     _Atomic uint64_t worker_queue_wait_count, worker_queue_wait_ns, worker_queue_wait_max_ns;
-    _Atomic uint64_t gpu_cb_done, gpu_cb_errors, gpu_cb_runtime_ns, gpu_cb_latency_ns;
+    _Atomic uint64_t gpu_cb_done, gpu_cb_errors, gpu_cb_runtime_ns, gpu_cb_runtime_max_ns;
+    _Atomic uint64_t gpu_cb_latency_ns, gpu_cb_latency_max_ns;
     _Atomic uint64_t present_drawable_wait_count, present_drawable_wait_ns, present_drawable_wait_max_ns;
-    _Atomic uint64_t present_no_drawable, present_encode_count, present_encode_ns;
-    _Atomic uint64_t present_submit_count, present_done_count, present_gpu_runtime_ns, present_gpu_latency_ns;
-    _Atomic uint64_t present_interval_count, present_interval_ns;
+    _Atomic uint64_t present_no_drawable, present_encode_count, present_encode_ns, present_encode_max_ns;
+    _Atomic uint64_t present_submit_count, present_done_count, present_gpu_runtime_ns, present_gpu_runtime_max_ns;
+    _Atomic uint64_t present_gpu_latency_ns, present_gpu_latency_max_ns;
+    _Atomic uint64_t present_interval_count, present_interval_ns, present_interval_max_ns;
     double last_present_submit; /* presenter-queue owned */
     id<MTLCommandBuffer> last_cb;
-    double encode_time, gpu_wait_time;
+    double encode_time, gpu_wait_time, max_exec_encode_time;
+    uint64_t exec_over_50ms, exec_over_100ms, exec_over_250ms; /* worker-queue owned */
     BOOL pipeline_set; /* in the open encoder */
     BOOL tess_factors; /* so is a tessellation factor buffer */
     uint32_t pre_raster_samples, pre_imageblock, pre_threadgroup, pre_tile_w, pre_tile_h; /* for the next pass */
@@ -2026,8 +2029,13 @@ typedef struct {
         atomic_fetch_add(&self->gpu_cb_done, 1);
         if (completed_at >= submitted_at)
             atomic_fetch_add(&self->gpu_cb_latency_ns, (uint64_t)((completed_at - submitted_at) * 1e9));
-        if (done.GPUStartTime > 0 && done.GPUEndTime >= done.GPUStartTime)
-            atomic_fetch_add(&self->gpu_cb_runtime_ns, (uint64_t)((done.GPUEndTime - done.GPUStartTime) * 1e9));
+        if (done.GPUStartTime > 0 && done.GPUEndTime >= done.GPUStartTime) {
+            uint64_t ns = (uint64_t)((done.GPUEndTime - done.GPUStartTime) * 1e9);
+            atomic_fetch_add(&self->gpu_cb_runtime_ns, ns);
+            metric_max_u64(&self->gpu_cb_runtime_max_ns, ns);
+        }
+        if (completed_at >= submitted_at)
+            metric_max_u64(&self->gpu_cb_latency_max_ns, (uint64_t)((completed_at - submitted_at) * 1e9));
         if (done.error) {
             atomic_fetch_add(&self->gpu_cb_errors, 1);
             self->failed++;
@@ -2174,9 +2182,14 @@ typedef struct {
         [back endEncoding];
     }
     double t1 = now_seconds();
+    double exec_encode = t1 - t_begin;
+    if (exec_encode > max_exec_encode_time) max_exec_encode_time = exec_encode;
+    if (exec_encode > 0.250) exec_over_250ms++;
+    else if (exec_encode > 0.100) exec_over_100ms++;
+    else if (exec_encode > 0.050) exec_over_50ms++;
     [self commit:cb channel:ch stamp:stamp complete:YES];
     double t2 = now_seconds();
-    encode_time += t1 - t_begin, gpu_wait_time += t2 - t1;
+    encode_time += exec_encode, gpu_wait_time += t2 - t1;
     if (++execs % 1000 == 0) {
         static double t0;
         if (!t0) t0 = now_seconds();
@@ -2186,19 +2199,29 @@ typedef struct {
         uint64_t gdn = atomic_exchange(&gpu_cb_done, 0);
         uint64_t ger = atomic_exchange(&gpu_cb_errors, 0);
         uint64_t grun = atomic_exchange(&gpu_cb_runtime_ns, 0);
+        uint64_t grunmax = atomic_exchange(&gpu_cb_runtime_max_ns, 0);
         uint64_t glat = atomic_exchange(&gpu_cb_latency_ns, 0);
+        uint64_t glatmax = atomic_exchange(&gpu_cb_latency_max_ns, 0);
         uint64_t dwn = atomic_exchange(&present_drawable_wait_count, 0);
         uint64_t dws = atomic_exchange(&present_drawable_wait_ns, 0);
         uint64_t dwm = atomic_exchange(&present_drawable_wait_max_ns, 0);
         uint64_t dnf = atomic_exchange(&present_no_drawable, 0);
         uint64_t pen = atomic_exchange(&present_encode_count, 0);
         uint64_t pes = atomic_exchange(&present_encode_ns, 0);
+        uint64_t pemax = atomic_exchange(&present_encode_max_ns, 0);
         uint64_t psn = atomic_exchange(&present_submit_count, 0);
         uint64_t pdn = atomic_exchange(&present_done_count, 0);
         uint64_t pgr = atomic_exchange(&present_gpu_runtime_ns, 0);
+        uint64_t pgrmax = atomic_exchange(&present_gpu_runtime_max_ns, 0);
         uint64_t pgl = atomic_exchange(&present_gpu_latency_ns, 0);
+        uint64_t pglmax = atomic_exchange(&present_gpu_latency_max_ns, 0);
         uint64_t pin = atomic_exchange(&present_interval_count, 0);
         uint64_t pis = atomic_exchange(&present_interval_ns, 0);
+        uint64_t pimax = atomic_exchange(&present_interval_max_ns, 0);
+        double max_exec_ms = max_exec_encode_time * 1000.0;
+        uint64_t over50 = exec_over_50ms, over100 = exec_over_100ms, over250 = exec_over_250ms;
+        max_exec_encode_time = 0;
+        exec_over_50ms = exec_over_100ms = exec_over_250ms = 0;
         fprintf(stderr, "hengevm: pvg-metal: %llu execs, %llu draws, %llu failed, %llu synced, %llu remaps, %.0f s; encoding %.2f s, submit %.2f s; pipeline render %llu/%llu tile %llu/%llu compute %llu/%llu; skipped %llu\n",
                 (unsigned long long)execs, (unsigned long long)draws, (unsigned long long)failed,
                 (unsigned long long)synced, (unsigned long long)remaps, now_seconds() - t0,
@@ -2206,16 +2229,22 @@ typedef struct {
                 (unsigned long long)render_pipeline_failed, (unsigned long long)tile_pipeline_ok,
                 (unsigned long long)tile_pipeline_failed, (unsigned long long)compute_pipeline_ok,
                 (unsigned long long)compute_pipeline_failed, (unsigned long long)draws_skipped_no_pipeline);
-        fprintf(stderr, "hengevm: pvg-timing: workerQ avg %.2f ms max %.2f ms depth %d; GPU cmd done %llu errors %llu avg-run %.2f ms avg-submit-to-done %.2f ms inflight %d\n",
+        fprintf(stderr, "hengevm: pvg-timing: workerQ avg %.2f ms max %.2f ms depth %d; execCPU avg %.2f ms max %.2f ms >50/100/250ms %llu/%llu/%llu; GPU cmd done %llu errors %llu run avg/max %.2f/%.2f ms submit-to-done avg/max %.2f/%.2f ms inflight %d\n",
                 qn ? (double)qsum / qn / 1e6 : 0.0, (double)qmax / 1e6,
-                atomic_exchange(&max_queued_work, 0), (unsigned long long)gdn, (unsigned long long)ger,
-                gdn ? (double)grun / gdn / 1e6 : 0.0, gdn ? (double)glat / gdn / 1e6 : 0.0,
+                atomic_exchange(&max_queued_work, 0), encode_time, max_exec_ms,
+                (unsigned long long)over50, (unsigned long long)over100, (unsigned long long)over250,
+                (unsigned long long)gdn, (unsigned long long)ger,
+                gdn ? (double)grun / gdn / 1e6 : 0.0, (double)grunmax / 1e6,
+                gdn ? (double)glat / gdn / 1e6 : 0.0, (double)glatmax / 1e6,
                 atomic_load(&inflight));
-        fprintf(stderr, "hengevm: pvg-present: drawable avg %.2f ms max %.2f ms nil %llu; encode avg %.2f ms; submitted %llu completed %llu GPU-run %.2f ms submit-to-done %.2f ms frame-submit-interval %.2f ms total-frames %llu\n",
+        fprintf(stderr, "hengevm: pvg-present: drawable avg/max %.2f/%.2f ms nil %llu; encode avg/max %.2f/%.2f ms; submitted %llu completed %llu GPU-run avg/max %.2f/%.2f ms submit-to-done avg/max %.2f/%.2f ms frame-submit-interval avg/max %.2f/%.2f ms total-frames %llu\n",
                 dwn ? (double)dws / dwn / 1e6 : 0.0, (double)dwm / 1e6, (unsigned long long)dnf,
-                pen ? (double)pes / pen / 1e6 : 0.0, (unsigned long long)psn, (unsigned long long)pdn,
-                pdn ? (double)pgr / pdn / 1e6 : 0.0, pdn ? (double)pgl / pdn / 1e6 : 0.0,
-                pin ? (double)pis / pin / 1e6 : 0.0, (unsigned long long)atomic_load(&gpu_frames));
+                pen ? (double)pes / pen / 1e6 : 0.0, (double)pemax / 1e6,
+                (unsigned long long)psn, (unsigned long long)pdn,
+                pdn ? (double)pgr / pdn / 1e6 : 0.0, (double)pgrmax / 1e6,
+                pdn ? (double)pgl / pdn / 1e6 : 0.0, (double)pglmax / 1e6,
+                pin ? (double)pis / pin / 1e6 : 0.0, (double)pimax / 1e6,
+                (unsigned long long)atomic_load(&gpu_frames));
         encode_time = gpu_wait_time = 0;
     }
     return YES;
@@ -2602,10 +2631,13 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
             if (present_encode_duration_ns) {
                 atomic_fetch_add(&present_encode_count, 1);
                 atomic_fetch_add(&present_encode_ns, present_encode_duration_ns);
+                metric_max_u64(&present_encode_max_ns, present_encode_duration_ns);
             }
             if (last_present_submit > 0 && present_submitted_at >= last_present_submit) {
+                uint64_t interval_ns = (uint64_t)((present_submitted_at - last_present_submit) * 1e9);
                 atomic_fetch_add(&present_interval_count, 1);
-                atomic_fetch_add(&present_interval_ns, (uint64_t)((present_submitted_at - last_present_submit) * 1e9));
+                atomic_fetch_add(&present_interval_ns, interval_ns);
+                metric_max_u64(&present_interval_max_ns, interval_ns);
             }
             last_present_submit = present_submitted_at;
             atomic_fetch_add(&present_submit_count, 1);
@@ -2614,8 +2646,13 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
                 atomic_fetch_add(&self->present_done_count, 1);
                 if (completed_at >= present_submitted_at)
                     atomic_fetch_add(&self->present_gpu_latency_ns, (uint64_t)((completed_at - present_submitted_at) * 1e9));
-                if (done.GPUStartTime > 0 && done.GPUEndTime >= done.GPUStartTime)
-                    atomic_fetch_add(&self->present_gpu_runtime_ns, (uint64_t)((done.GPUEndTime - done.GPUStartTime) * 1e9));
+                if (done.GPUStartTime > 0 && done.GPUEndTime >= done.GPUStartTime) {
+                    uint64_t ns = (uint64_t)((done.GPUEndTime - done.GPUStartTime) * 1e9);
+                    atomic_fetch_add(&self->present_gpu_runtime_ns, ns);
+                    metric_max_u64(&self->present_gpu_runtime_max_ns, ns);
+                }
+                if (completed_at >= present_submitted_at)
+                    metric_max_u64(&self->present_gpu_latency_max_ns, (uint64_t)((completed_at - present_submitted_at) * 1e9));
             }];
             [cb presentDrawable:drawable];
             [cb commit];
