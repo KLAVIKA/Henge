@@ -2594,14 +2594,14 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
         // Serialize the final check and commit with set_layer: a switch that has
         // returned must not be followed by a commit to its old target.
         double present_encode_end = now_seconds();
-        uint64_t present_encode_ns = present_encode_end >= present_encode_start
+        uint64_t present_encode_duration_ns = present_encode_end >= present_encode_start
             ? (uint64_t)((present_encode_end - present_encode_start) * 1e9) : 0;
         os_unfair_lock_lock(&screen_lock);
         if (layer_generation == generation && layer == target) {
             double present_submitted_at = now_seconds();
-            if (present_encode_ns) {
+            if (present_encode_duration_ns) {
                 atomic_fetch_add(&present_encode_count, 1);
-                atomic_fetch_add(&present_encode_ns, present_encode_ns);
+                atomic_fetch_add(&present_encode_ns, present_encode_duration_ns);
             }
             if (last_present_submit > 0 && present_submitted_at >= last_present_submit) {
                 atomic_fetch_add(&present_interval_count, 1);
