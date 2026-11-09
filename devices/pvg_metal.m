@@ -1280,7 +1280,7 @@ static BOOL has_guest_pages(HvObject *o) {
     }
     [blit endEncoding];
     if (cb) {
-        [self commit:cb channel:0 stamp:0 complete:NO];
+        [self commit:cb channel:0 stamp:0 complete:NO task:task execID:0 resources:count buffers:0 payloadBytes:0 draws:0 encodeMs:0];
         synced++;
     }
 }
