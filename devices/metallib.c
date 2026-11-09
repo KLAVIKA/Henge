@@ -118,8 +118,8 @@ static int bc_read_abbrev(HvBCReader *r, HvBCAbbrev *a) {
             if (op->kind == BC_FIXED || op->kind == BC_VBR)
                 op->width = (unsigned)bc_read_vbr(r, 5);
             if (op->kind < BC_FIXED || op->kind > BC_BLOB ||
-                ((op->kind == BC_FIXED || op->kind == BC_VBR) &&
-                 (!op->width || op->width > 32))) r->bad = 1;
+                (op->kind == BC_FIXED && (!op->width || op->width > 32)) ||
+                (op->kind == BC_VBR && (op->width < 2 || op->width > 32))) r->bad = 1;
         }
         if (r->bad) return 0;
     }
@@ -221,8 +221,14 @@ static int bc_apply_triple(uint8_t *bytes, size_t limit, HvBCValue *values, size
         memset(out + 6, '0', rest);
         out[6 + rest / 2] = '.';
         int can_write = values[i - 2].writable && values[i - 1].writable;
-        for (size_t j = 0; j < suffix_len; j++)
-            if (!values[suffix + j].writable) can_write = 0;
+        for (size_t j = 0; j < suffix_len; j++) {
+            const HvBCValue *v = &values[suffix + j];
+            unsigned char ch = (unsigned char)out[j];
+            if (!v->writable ||
+                (v->kind == BC_CHAR6 && bc_char6_value(ch) < 0) ||
+                (v->kind == BC_FIXED && v->width < 8 && ch >= (1u << v->width)))
+                can_write = 0;
+        }
         if (!can_write) continue;
         if (sample_before && sample_before_size && !sample_before[0]) {
             size_t n = text_len - (i - 9);
