@@ -20,7 +20,7 @@ int hv_pvg_lite_frame(HvPvgLite *p, const uint8_t **pixels, uint32_t *width, uin
 /* Between the device and its Metal side (pvg_metal.m). */
 typedef struct HvPvgMetal HvPvgMetal;
 HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite);
-void hv_pvg_metal_submit(HvPvgMetal *m, HvPvgLite *lite, uint32_t channel, uint32_t *command, uint32_t length);
+void hv_pvg_metal_submit(HvPvgMetal *m, HvPvgLite *lite, uint32_t channel, uint64_t sequence, uint32_t *command, uint32_t length);
 int hv_pvg_metal_snapshot(HvPvgMetal *m, uint8_t *bgra, uint32_t width, uint32_t height);
 int hv_pvg_lite_snapshot(HvPvgLite *p, uint8_t *bgra, uint32_t width, uint32_t height);
 int hv_pvg_metal_frame(HvPvgMetal *m, const uint8_t **pixels, uint32_t *width, uint32_t *height);
@@ -31,7 +31,7 @@ void *hv_pvg_lite_phys(HvPvgLite *p, uint64_t pa, uint64_t length);
 uint64_t hv_pvg_lite_task_objects(HvPvgLite *p, uint32_t task);
 /* A surface's descriptor (1 KB), or NULL if the mapper has none for it. */
 const uint8_t *hv_pvg_lite_surface(HvPvgLite *p, uint32_t mapping);
-void hv_pvg_metal_unmap(HvPvgMetal *m, uint32_t mapping);
+void hv_pvg_metal_unmap(HvPvgMetal *m, uint32_t mapping, uint64_t sequence);
 void hv_pvg_metal_cursor_moved(HvPvgMetal *m);
 /* Frames go to this CAMetalLayer from now on, drawn by the GPU. Any thread. */
 void hv_pvg_metal_set_layer(HvPvgMetal *m, void *layer);
