@@ -207,12 +207,21 @@ static int bc_apply_triple(uint8_t *bytes, size_t limit, HvBCValue *values, size
     while (text_len && text[text_len - 1] == 0) text_len--;
     int changed = 0;
     static const char key[] = "-apple-macosx";
-    for (size_t i = 9; i + sizeof(key) - 1 <= text_len; i++) {
+    for (size_t i = 5; i + sizeof(key) - 1 <= text_len; i++) {
         if (memcmp(text + i, key, sizeof(key) - 1) != 0) continue;
-        if (memcmp(text + i - 9, "air64_v", 7) != 0 ||
-            text[i - 2] < '0' || text[i - 2] > '9' ||
-            text[i - 1] < '0' || text[i - 1] > '9') continue;
-        size_t suffix = i + 7;
+
+        /* Apple AIR bitcode appears in both versioned (air64_v27-apple-...)
+           and versionless (air64-apple-...) forms. In the latter, the AIR
+           version is carried by the metallib VERS tag, not the triple prefix. */
+        int has_air_version = i >= 9 &&
+            memcmp(text + i - 9, "air64_v", 7) == 0 &&
+            text[i - 2] >= '0' && text[i - 2] <= '9' &&
+            text[i - 1] >= '0' && text[i - 1] <= '9';
+        int is_versionless_air64 = i == 5 && memcmp(text, "air64", 5) == 0;
+        if (!has_air_version && !is_versionless_air64) continue;
+
+        size_t triple_start = has_air_version ? i - 9 : 0;
+        size_t suffix = i + 7; /* preserve "-apple-" and replace from "macosx" */
         size_t suffix_len = text_len - suffix;
         if (suffix_len < 12 || suffix_len >= 64) continue;
         char out[64];
@@ -220,7 +229,8 @@ static int bc_apply_triple(uint8_t *bytes, size_t limit, HvBCValue *values, size
         memcpy(out, "ios17.", 6);
         memset(out + 6, '0', rest);
         out[6 + rest / 2] = '.';
-        int can_write = values[i - 2].writable && values[i - 1].writable;
+        int can_write = !has_air_version ||
+            (values[i - 2].writable && values[i - 1].writable);
         for (size_t j = 0; j < suffix_len; j++) {
             const HvBCValue *v = &values[suffix + j];
             unsigned char ch = (unsigned char)out[j];
@@ -231,23 +241,24 @@ static int bc_apply_triple(uint8_t *bytes, size_t limit, HvBCValue *values, size
         }
         if (!can_write) continue;
         if (sample_before && sample_before_size && !sample_before[0]) {
-            size_t n = text_len - (i - 9);
+            size_t n = text_len - triple_start;
             if (n >= sample_before_size) n = sample_before_size - 1;
-            memcpy(sample_before, text + i - 9, n);
+            memcpy(sample_before, text + triple_start, n);
             sample_before[n] = 0;
         }
-        if (!bc_write_char(bytes, limit, &values[i - 2], '2') ||
-            !bc_write_char(bytes, limit, &values[i - 1], '6')) continue;
+        if (has_air_version &&
+            (!bc_write_char(bytes, limit, &values[i - 2], '2') ||
+             !bc_write_char(bytes, limit, &values[i - 1], '6'))) continue;
         for (size_t j = 0; j < suffix_len; j++) {
             if (!bc_write_char(bytes, limit, &values[suffix + j], (unsigned char)out[j]))
                 return changed;
             text[suffix + j] = out[j];
         }
-        text[i - 2] = '2', text[i - 1] = '6';
+        if (has_air_version) text[i - 2] = '2', text[i - 1] = '6';
         if (sample_after && sample_after_size && !sample_after[0]) {
-            size_t n = text_len - (i - 9);
+            size_t n = text_len - triple_start;
             if (n >= sample_after_size) n = sample_after_size - 1;
-            memcpy(sample_after, text + i - 9, n);
+            memcpy(sample_after, text + triple_start, n);
             sample_after[n] = 0;
         }
         changed++;

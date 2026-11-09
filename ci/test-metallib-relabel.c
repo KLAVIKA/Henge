@@ -18,8 +18,8 @@ static void put64(uint8_t *p, uint64_t v) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 2) {
-        fprintf(stderr, "usage: %s AIR-bitcode\n", argv[0]);
+    if (argc != 4) {
+        fprintf(stderr, "usage: %s AIR-bitcode expected-before expected-after\n", argv[0]);
         return 2;
     }
     FILE *file = fopen(argv[1], "rb");
@@ -65,8 +65,8 @@ int main(int argc, char **argv) {
     char before[96] = {0}, after[96] = {0};
     int fields = hv_metallib_relabel(lib, total, 2, &triple_changes,
                                      before, sizeof(before), after, sizeof(after));
-    const char *expected_before = "air64_v27-apple-macosx15.0.0";
-    const char *expected_after = "air64_v26-apple-ios17.000.00";
+    const char *expected_before = argv[2];
+    const char *expected_after = argv[3];
     if (fields < 0 || triple_changes != 1 ||
         strlen(before) != strlen(after) || strcmp(before, expected_before) || strcmp(after, expected_after)) {
         fprintf(stderr, "FAIL fields=%d triple_changes=%d before=[%s] after=[%s]\n",
