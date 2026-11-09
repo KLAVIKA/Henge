@@ -65,6 +65,7 @@ enum { OBJ_BUFFER = 1, OBJ_TEXTURE = 2, OBJ_FUNCTION = 6, OBJ_SERIALIZED = 7, OB
 @public
     id object;
     uint32_t entry[3];
+    uint64_t mapping_id; /* IOSurface mapping for this texture, inherited by texture views */
     /* A buffer's guest pages, mapped contiguously. */
     uint8_t *mapped;
     BOOL mapping_in_buffer; /* the buffer over them frees them */
@@ -144,6 +145,7 @@ enum { OBJ_BUFFER = 1, OBJ_TEXTURE = 2, OBJ_FUNCTION = 6, OBJ_SERIALIZED = 7, OB
     BOOL tess_factors; /* so is a tessellation factor buffer */
     uint32_t pre_raster_samples, pre_imageblock, pre_threadgroup, pre_tile_w, pre_tile_h; /* for the next pass */
     BOOL tracing; /* HV_PVG_TRACE_FILE exists: say what each exec draws */
+    uint64_t event_sequence; /* current mapper/channel enqueue sequence; worker-owned */
     /* The newest frame, BGRA, for hv_pvg_metal_frame, and the same without the pointer on it. */
     uint8_t *frame, *base;
     uint32_t frame_w, frame_h;
@@ -711,6 +713,7 @@ static void hv_dump_failed_library(NSData *lib, uint32_t task, uint64_t function
         if (!from) { [self complain:[NSString stringWithFormat:@"view of nothing (tag %u, ref %u)", h.tag, h.buffer]]; return; }
         o->parent = parent;
         o->surface = parent->surface;
+        o->mapping_id = parent->mapping_id;
         NSRange levels = NSMakeRange((NSUInteger)v.levels[0], (NSUInteger)v.levels[1]), slices = NSMakeRange((NSUInteger)v.slices[0], (NSUInteger)v.slices[1]);
         if (h.tag == 7) o->object = [from newTextureViewWithPixelFormat:(MTLPixelFormat)v.format];
         else if (h.tag == 8) o->object = [from newTextureViewWithPixelFormat:(MTLPixelFormat)v.format textureType:(MTLTextureType)v.type levels:levels slices:slices];
@@ -902,7 +905,15 @@ static void sync_iosurface(HvObject *s) {
     struct __attribute__((packed)) { uint64_t mapping; uint32_t tag, size, ref; uint8_t d[64]; } h;
     memset(&h, 0, sizeof h);
     const uint32_t head = (uint32_t)offsetof(__typeof__(h), d);
-    if (hv_pvg_lite_task_read(lite, task, at, &h, head + 32)) return;
+    int header_read = hv_pvg_lite_task_read(lite, task, at, &h, head + 32);
+    if (header_read) {
+        static unsigned read_failures;
+        if (read_failures++ < 64)
+            fprintf(stderr, "hengevm: pvg-metal: mapped-texture header-read-failed seq %llu task %u at %#llx status %d\n",
+                    (unsigned long long)event_sequence, task, (unsigned long long)at, header_read);
+        return;
+    }
+    o->mapping_id = h.mapping;
     /* size is the description's own length (0x38 for a v2 one), after the header */
     if (h.size > 32 && hv_pvg_lite_task_read(lite, task, at, &h, head + MIN(h.size, (uint32_t)sizeof h.d))) {
         memset(h.d + 32, 0, sizeof h.d - 32); /* past the end of the task: keep what the first read had */
@@ -916,12 +927,15 @@ static void sync_iosurface(HvObject *s) {
             static unsigned missing;
             if (missing++ < 32) fprintf(stderr, "hengevm: pvg-metal: surface %llu descriptor lookup failed (task %u)\n", (unsigned long long)h.mapping, task);
             [self complain:[NSString stringWithFormat:@"surface %llu has no descriptor", h.mapping]];
+            fprintf(stderr, "hengevm: pvg-metal: mapped-texture failed seq %llu task %u mapping %llu reason descriptor-missing\n",
+                    (unsigned long long)event_sequence, task, (unsigned long long)h.mapping);
             return;
         }
         uint32_t list, first;
         uint64_t alloc, row;
         memcpy(&list, desc, 4), memcpy(&alloc, desc + 0x18, 8), memcpy(&row, desc + 0x30, 8), memcpy(&first, desc + 0x60, 4);
         surface = [HvObject new];
+        surface->mapping_id = h.mapping;
         surface->length = (alloc + first + 0x3fff) & ~0x3fffull;
         surface->row = row;
         surface->first = first;
@@ -933,6 +947,8 @@ static void sync_iosurface(HvObject *s) {
         const uint32_t *pages = (list & 1) ? hv_pvg_lite_phys(lite, (uint64_t)(list & ~1u) << 12, n * 4) : NULL;
         if (!pages || vm_allocate(mach_task_self(), &base, surface->length, VM_FLAGS_ANYWHERE) != KERN_SUCCESS) {
             [self complain:[NSString stringWithFormat:@"surface %llu has no pages", h.mapping]];
+            fprintf(stderr, "hengevm: pvg-metal: mapped-texture failed seq %llu task %u mapping %llu reason pages-missing list %#x alloc %llu\n",
+                    (unsigned long long)event_sequence, task, (unsigned long long)h.mapping, list, (unsigned long long)alloc);
             return;
         }
         surface->mapped = (uint8_t *)base;
@@ -949,9 +965,10 @@ static void sync_iosurface(HvObject *s) {
         surface->mapping_in_buffer = surface->object != nil;
         surfaces[key] = surface;
         static unsigned registered;
-        if (registered++ < 64)
-            fprintf(stderr, "hengevm: pvg-metal: surface registered mapping %llu task %u dimensions %ux%u total %lu\n",
-                    (unsigned long long)h.mapping, task, surface->surface_w, surface->surface_h, (unsigned long)surfaces.count);
+        if (registered++ < 128)
+            fprintf(stderr, "hengevm: pvg-metal: surface registered seq %llu mapping %llu task %u dimensions %ux%u buffer %d object %p total %lu\n",
+                    (unsigned long long)event_sequence, (unsigned long long)h.mapping, task, surface->surface_w, surface->surface_h,
+                    surface->object != nil, (__bridge void *)surface->object, (unsigned long)surfaces.count);
         if (desc[0x3e] >= 2) {
             surface->alloc = alloc;
             IOSurfaceRef made = make_iosurface(surface, desc, alloc);
@@ -1033,6 +1050,11 @@ static void sync_iosurface(HvObject *s) {
         o->object = [device newTextureWithDescriptor:t]; /* something to bind: it stays empty */
     }
     if (!plane) mapped_textures[key] = o->object;
+    static unsigned result_logs;
+    if (result_logs++ < 128)
+        fprintf(stderr, "hengevm: pvg-metal: mapped-texture result seq %llu task %u mapping %llu plane %u object %d surface %p registered %d\n",
+                (unsigned long long)event_sequence, task, (unsigned long long)h.mapping, plane, o->object != nil,
+                (__bridge void *)surface, surfaces[key] == surface);
 }
 
 - (HvObject *)object:(uint32_t)ref task:(uint32_t)task {
@@ -1043,7 +1065,27 @@ static void sync_iosurface(HvObject *s) {
     NSMutableDictionary *objs = tasks[@(task)];
     if (!objs) tasks[@(task)] = objs = [NSMutableDictionary new];
     HvObject *o = objs[@(ref)];
+    uint32_t type = e[0] & 0xff, size = e[0] >> 8;
+    uint64_t at = (uint64_t)e[2] << 32 | e[1];
     if (o && !memcmp(o->entry, e, 12)) {
+        if (type == OBJ_MAPPED_TEXTURE || o->surface) {
+            static unsigned cache_hits;
+            if (cache_hits++ < 256) {
+                uint64_t current_mapping = o->mapping_id;
+                int record_read = 0;
+                if (type == OBJ_MAPPED_TEXTURE) {
+                    struct __attribute__((packed)) { uint64_t mapping; uint32_t tag, size, ref; } record = {0};
+                    record_read = hv_pvg_lite_task_read(lite, task, at, &record, sizeof record);
+                    if (!record_read) current_mapping = record.mapping;
+                }
+                BOOL registered = o->surface && surfaces[@(o->surface->mapping_id)] == o->surface;
+                fprintf(stderr, "hengevm: pvg-metal: object-cache-hit seq %llu task %u ref %u type %u at %#llx saved-mapping %llu current-mapping %llu record-read %d surface %p surface-mapping %llu registered %d object %d parent %p\n",
+                        (unsigned long long)event_sequence, task, ref, type, (unsigned long long)at,
+                        (unsigned long long)o->mapping_id, (unsigned long long)current_mapping, record_read,
+                        (__bridge void *)o->surface, (unsigned long long)(o->surface ? o->surface->mapping_id : 0),
+                        registered, o->object != nil, (__bridge void *)o->parent);
+            }
+        }
         if (!o->follows) return o;
         if (o->follows->mapped) refresh_pages(self, task, o->follows);
         if (o->follows->generation == o->follows_generation) return o;
@@ -1051,8 +1093,6 @@ static void sync_iosurface(HvObject *s) {
     o = [HvObject new];
     memcpy(o->entry, e, 12);
     objs[@(ref)] = o;
-    uint32_t type = e[0] & 0xff, size = e[0] >> 8;
-    uint64_t at = (uint64_t)e[2] << 32 | e[1];
     switch (type) {
     case OBJ_BUFFER: [self makeBuffer:o at:at task:task]; break;
     case OBJ_TEXTURE: [self makeTexture:o at:at size:size task:task]; break;
@@ -2251,8 +2291,8 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
         if (unknown++ < 32) {
             NSMutableString *keys = [NSMutableString new];
             for (NSNumber *key in surfaces) [keys appendFormat:@"%@,", key];
-            fprintf(stderr, "hengevm: pvg-metal: display lookup missing mapping %llu; registered count %lu keys [%s]\n",
-                    (unsigned long long)mapping, (unsigned long)surfaces.count, keys.UTF8String);
+            fprintf(stderr, "hengevm: pvg-metal: display lookup missing seq %llu mapping %llu; registered count %lu keys [%s]\n",
+                    (unsigned long long)event_sequence, (unsigned long long)mapping, (unsigned long)surfaces.count, keys.UTF8String);
         }
         [self complain:[NSString stringWithFormat:@"swap to unknown surface %llu", mapping]];
         return;
@@ -2465,8 +2505,8 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
         if (unknown_cpu++ < 32) {
             NSMutableString *keys = [NSMutableString new];
             for (NSNumber *key in surfaces) [keys appendFormat:@"%@,", key];
-            fprintf(stderr, "hengevm: pvg-metal: CPU display lookup missing mapping %llu; registered count %lu keys [%s]\n",
-                    (unsigned long long)mapping, (unsigned long)surfaces.count, keys.UTF8String);
+            fprintf(stderr, "hengevm: pvg-metal: CPU display lookup missing seq %llu mapping %llu; registered count %lu keys [%s]\n",
+                    (unsigned long long)event_sequence, (unsigned long long)mapping, (unsigned long)surfaces.count, keys.UTF8String);
         }
         [self complain:[NSString stringWithFormat:@"swap to unknown surface %llu", mapping]];
         return;
@@ -2571,10 +2611,11 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
     }
 }
 
-void hv_pvg_metal_submit(HvPvgMetal *m, HvPvgLite *lite, uint32_t ch, uint32_t *cmd, uint32_t len) {
+void hv_pvg_metal_submit(HvPvgMetal *m, HvPvgLite *lite, uint32_t ch, uint64_t sequence, uint32_t *cmd, uint32_t len) {
     HvReplay *r = (__bridge HvReplay *)m;
     dispatch_async(r->worker, ^{
         @autoreleasepool {
+            r->event_sequence = sequence;
             uint32_t op = cmd[0] & 0xffff, skip = (cmd[0] >> 16) * 8; /* the barriers come first */
             const uint32_t *args = (const uint32_t *)((const uint8_t *)cmd + 12 + skip);
             uint32_t n = len > 12 + skip ? len - 12 - skip : 0;
@@ -2590,12 +2631,18 @@ void hv_pvg_metal_submit(HvPvgMetal *m, HvPvgLite *lite, uint32_t ch, uint32_t *
                         uint32_t shown = MIN(MIN(nres, 12u), available);
                         for (uint32_t i = 0; i < shown; i++)
                             [refs appendFormat:@"%@%u", i ? @"," : @"", res[i * 2]];
-                        fprintf(stderr, "hengevm: pvg-metal: exec op %#x channel %u task %u resources %u buffers %u refs [%s]\n",
-                                op, ch, task, nres, nbuf, refs.UTF8String);
+                        fprintf(stderr, "hengevm: pvg-metal: exec seq %llu op %#x channel %u task %u resources %u buffers %u refs [%s]\n",
+                                (unsigned long long)sequence, op, ch, task, nres, nbuf, refs.UTF8String);
                     }
                     gpu_completes = [r exec:args length:n channel:ch stamp:cmd[2]];
                 } else if ((op == 0x25 || op == 0x28) && n >= 8) { /* {task, ref} or {task, tag, size, ref} */
+                    static unsigned destroy_logs;
                     uint32_t ref = op == 0x25 ? args[1] : (n >= 16 ? args[3] : 0);
+                    HvObject *old = r->tasks[@(args[0])][@(ref)];
+                    if (destroy_logs++ < 128)
+                        fprintf(stderr, "hengevm: pvg-metal: object-destroy seq %llu op %#x task %u ref %u type %u mapping %llu surface %p\n",
+                                (unsigned long long)sequence, op, args[0], ref, old ? old->entry[0] & 0xff : 0,
+                                (unsigned long long)(old ? old->mapping_id : 0), (__bridge void *)(old ? old->surface : nil));
                     [r->tasks[@(args[0])] removeObjectForKey:@(ref)];
                 } else if (op == 0x35 || op == 0x3e) {
                     [r synchronize:args length:n];
@@ -2605,15 +2652,23 @@ void hv_pvg_metal_submit(HvPvgMetal *m, HvPvgLite *lite, uint32_t ch, uint32_t *
                     /* "May be thrown away": Apple's host only marks it purgeable, and the bytes stay
                        until the system needs the memory. Here they just stay. */
                 } else if (op == 0x20 && n >= 4) {
-                    [r->tasks removeObjectForKey:@(args[0] >> 1)];
+                    static unsigned task_destroy_logs;
+                    uint32_t task = args[0] >> 1;
+                    NSMutableDictionary *old = r->tasks[@(task)];
+                    NSUInteger mapped = 0;
+                    for (HvObject *item in old.allValues) if (item->surface || (item->entry[0] & 0xff) == OBJ_MAPPED_TEXTURE) mapped++;
+                    if (task_destroy_logs++ < 64)
+                        fprintf(stderr, "hengevm: pvg-metal: task-destroy seq %llu task %u cached %lu mapped-or-view %lu\n",
+                                (unsigned long long)sequence, task, (unsigned long)old.count, (unsigned long)mapped);
+                    [r->tasks removeObjectForKey:@(task)];
                 } else {
                     hv_pvg_lite_command(lite, cmd, len);
                     if (op == 8 && n >= 16) {
                         static unsigned swap_logs;
                         uint64_t mapping = (uint64_t)args[3] << 32 | args[2];
                         if (swap_logs++ < 32)
-                            fprintf(stderr, "hengevm: pvg-metal: display swap request mapping %llu port %u surfaces %lu\n",
-                                    (unsigned long long)mapping, args[0], (unsigned long)r->surfaces.count);
+                            fprintf(stderr, "hengevm: pvg-metal: display swap request seq %llu mapping %llu port %u surfaces %lu\n",
+                                    (unsigned long long)sequence, (unsigned long long)mapping, args[0], (unsigned long)r->surfaces.count);
                         if (r->tracing) fprintf(stderr, "trace: swap to %llu\n", (uint64_t)args[3] << 32 | args[2]);
                         cp_note_swap(r, (uint64_t)args[3] << 32 | args[2], args, n);
                         [r present:(uint64_t)args[3] << 32 | args[2]];
@@ -2673,12 +2728,32 @@ void hv_pvg_metal_cursor_moved(HvPvgMetal *m) {
     });
 }
 
-void hv_pvg_metal_unmap(HvPvgMetal *m, uint32_t mapping) {
+void hv_pvg_metal_unmap(HvPvgMetal *m, uint32_t mapping, uint64_t sequence) {
     HvReplay *r = (__bridge HvReplay *)m;
     dispatch_async(r->worker, ^{
+        r->event_sequence = sequence;
         /* The last mapping of a shared multi-plane surface takes its table entry along: the entry holds the host
            IOSurface (4K video frames are 27-65 MB of Henge's own memory), and the guest reuses its memory for others. */
         HvObject *s = r->surfaces[@(mapping)];
+        static unsigned unmap_logs;
+        if (unmap_logs++ < 128) {
+            NSUInteger refs = 0;
+            NSMutableString *owners = [NSMutableString new];
+            for (NSNumber *task_key in r->tasks) {
+                NSDictionary *objects = r->tasks[task_key];
+                for (NSNumber *ref_key in objects) {
+                    HvObject *item = objects[ref_key];
+                    if (s && item->surface == s) {
+                        refs++;
+                        if (refs <= 12) [owners appendFormat:@"%@:%@,", task_key, ref_key];
+                    }
+                }
+            }
+            fprintf(stderr, "hengevm: pvg-metal: unmap-worker seq %llu mapping %u surface %p found %d mapping-id %llu owners %lu [%s] surfaces-before %lu\n",
+                    (unsigned long long)sequence, mapping, (__bridge void *)s, s != nil,
+                    (unsigned long long)(s ? s->mapping_id : 0), (unsigned long)refs, owners.UTF8String,
+                    (unsigned long)r->surfaces.count);
+        }
         NSString *pk = s ? s->planar_key : nil;
         if (pk) {
             s->planar_key = nil;
@@ -2693,6 +2768,9 @@ void hv_pvg_metal_unmap(HvPvgMetal *m, uint32_t mapping) {
         }
         [r->surfaces removeObjectForKey:@(mapping)];
         [r->mapped_textures removeObjectForKey:@(mapping)];
+        if (unmap_logs <= 128)
+            fprintf(stderr, "hengevm: pvg-metal: unmap-worker-done seq %llu mapping %u surfaces-after %lu\n",
+                    (unsigned long long)sequence, mapping, (unsigned long)r->surfaces.count);
     });
 }
 
