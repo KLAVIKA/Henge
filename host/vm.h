@@ -72,6 +72,13 @@ void hv_vm_mouse_move(int dx, int dy);
 void hv_vm_mouse_button(int button, int down); /* 0 left, 1 right, 2 middle */
 void hv_vm_mouse_wheel(int dy);
 void hv_vm_mouse_hwheel(int dx);
+
+/* Diagnostic correlation: host input -> first guest PVG response (within 2 s). */
+void hv_vm_note_ui_input(void);
+void hv_vm_note_pointer_input(void);
+void hv_vm_note_ui_response(void);
+void hv_vm_note_pointer_response(void);
+void hv_vm_input_latency_dump(void);
 /* Where the guest has its pointer, in display pixels. 0, or -1 before it has one. */
 int hv_vm_pointer(int *x, int *y);
 /* A small picture of the display, BGRA, width * height * 4 bytes. 0, or -1 before anything shows. */
