@@ -41,6 +41,7 @@
 #include <string.h>
 
 #include "../core/machine.h"
+#include "../host/vm.h"
 
 #define MAX_CHANNELS 16
 
@@ -752,7 +753,10 @@ static void gfx_write(void *opaque, uint64_t off, uint64_t v, unsigned size) {
     } else if (p->log && off != 0x1020) {
         fprintf(stderr, "hengevm: pvg-lite: write +%llx = %llx\n", (unsigned long long)off, (unsigned long long)v);
     }
-    if (off == 0x1220 && p->metal) hv_pvg_metal_cursor_moved(p->metal); /* the display's doorbell: the pointer moved */
+    if (off == 0x1220 && p->metal) {
+        hv_vm_note_pointer_response();
+        hv_pvg_metal_cursor_moved(p->metal); /* the display's doorbell: the pointer moved */
+    }
 }
 
 static uint64_t iosfc_read(void *opaque, uint64_t off, unsigned size) {
