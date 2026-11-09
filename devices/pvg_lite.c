@@ -631,11 +631,6 @@ static void do_channel(HvPvgLite *p, uint32_t ch) {
                 fprintf(stderr, "hengevm: pvg-order: enqueue seq %llu ch %u rd %#x op %#x stamp %#x len %u\n",
                         (unsigned long long)sequence, ch, rd, hdr[0] & 0xffff, hdr[2], hdr[1]);
             uint32_t *copy = malloc(hdr[1]);
-            if (!copy) {
-                fprintf(stderr, "hengevm: pvg-lite: command copy allocation failed (%u bytes)\n", hdr[1]);
-                rd += hdr[1];
-                continue;
-            }
             ring_read(p, table, size, rd, copy, hdr[1]);
             hv_pvg_metal_submit(p->metal, p, ch, sequence, copy, hdr[1]);
         } else {
