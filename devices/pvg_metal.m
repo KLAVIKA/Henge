@@ -141,7 +141,7 @@ enum { OBJ_BUFFER = 1, OBJ_TEXTURE = 2, OBJ_FUNCTION = 6, OBJ_SERIALIZED = 7, OB
     /* Work the GPU has not finished. Stamps are given back in the order they came: the
        GPU's completion handlers run in the order of commit. */
     _Atomic int inflight;
-    _Atomic int queued_work, max_queued_work;
+    _Atomic int queued_work, max_queued_work, max_inflight;
     _Atomic uint64_t worker_queue_wait_count, worker_queue_wait_ns, worker_queue_wait_max_ns;
     _Atomic uint64_t gpu_cb_done, gpu_cb_errors, gpu_cb_runtime_ns, gpu_cb_runtime_max_ns;
     _Atomic uint64_t gpu_cb_latency_ns, gpu_cb_latency_max_ns;
@@ -150,6 +150,8 @@ enum { OBJ_BUFFER = 1, OBJ_TEXTURE = 2, OBJ_FUNCTION = 6, OBJ_SERIALIZED = 7, OB
     _Atomic uint64_t present_submit_count, present_done_count, present_gpu_runtime_ns, present_gpu_runtime_max_ns;
     _Atomic uint64_t present_gpu_latency_ns, present_gpu_latency_max_ns;
     _Atomic uint64_t present_interval_count, present_interval_ns, present_interval_max_ns;
+    _Atomic uint64_t screen_start_count, screen_start_ns, screen_start_max_ns;
+    double last_screen_kick; /* screen_lock protects */
     double last_present_submit; /* presenter-queue owned */
     id<MTLCommandBuffer> last_cb;
     double encode_time, gpu_wait_time, max_exec_encode_time;
@@ -2022,7 +2024,8 @@ typedef struct {
     static int sync = -1; /* HV_PVG_SYNC: wait for the GPU after every batch */
     if (sync < 0) sync = getenv("HV_PVG_SYNC") != NULL;
     HvPvgLite *l = lite;
-    atomic_fetch_add(&inflight, 1);
+    int pending = atomic_fetch_add(&inflight, 1) + 1;
+    metric_max_int(&max_inflight, pending);
     double submitted_at = now_seconds();
     [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
         double completed_at = now_seconds();
@@ -2218,6 +2221,10 @@ typedef struct {
         uint64_t pin = atomic_exchange(&present_interval_count, 0);
         uint64_t pis = atomic_exchange(&present_interval_ns, 0);
         uint64_t pimax = atomic_exchange(&present_interval_max_ns, 0);
+        uint64_t ssn = atomic_exchange(&screen_start_count, 0);
+        uint64_t sss = atomic_exchange(&screen_start_ns, 0);
+        uint64_t ssm = atomic_exchange(&screen_start_max_ns, 0);
+        int max_inflight_count = atomic_exchange(&max_inflight, 0);
         double max_exec_ms = max_exec_encode_time * 1000.0;
         uint64_t over50 = exec_over_50ms, over100 = exec_over_100ms, over250 = exec_over_250ms;
         max_exec_encode_time = 0;
@@ -2237,7 +2244,8 @@ typedef struct {
                 gdn ? (double)grun / gdn / 1e6 : 0.0, (double)grunmax / 1e6,
                 gdn ? (double)glat / gdn / 1e6 : 0.0, (double)glatmax / 1e6,
                 atomic_load(&inflight));
-        fprintf(stderr, "hengevm: pvg-present: drawable avg/max %.2f/%.2f ms nil %llu; encode avg/max %.2f/%.2f ms; submitted %llu completed %llu GPU-run avg/max %.2f/%.2f ms submit-to-done avg/max %.2f/%.2f ms frame-submit-interval avg/max %.2f/%.2f ms total-frames %llu\n",
+        fprintf(stderr, "hengevm: pvg-present: screen-update-to-start avg/max %.2f/%.2f ms; drawable avg/max %.2f/%.2f ms nil %llu; encode avg/max %.2f/%.2f ms; submitted %llu completed %llu GPU-run avg/max %.2f/%.2f ms submit-to-done avg/max %.2f/%.2f ms frame-submit-interval avg/max %.2f/%.2f ms total-frames %llu\n",
+                ssn ? (double)sss / ssn / 1e6 : 0.0, (double)ssm / 1e6,
                 dwn ? (double)dws / dwn / 1e6 : 0.0, (double)dwm / 1e6, (unsigned long long)dnf,
                 pen ? (double)pes / pen / 1e6 : 0.0, (double)pemax / 1e6,
                 (unsigned long long)psn, (unsigned long long)pdn,
@@ -2245,6 +2253,8 @@ typedef struct {
                 pdn ? (double)pgl / pdn / 1e6 : 0.0, (double)pglmax / 1e6,
                 pin ? (double)pis / pin / 1e6 : 0.0, (double)pimax / 1e6,
                 (unsigned long long)atomic_load(&gpu_frames));
+        fprintf(stderr, "hengevm: pvg-inflight: current %d max %d\n",
+                atomic_load(&inflight), max_inflight_count);
         encode_time = gpu_wait_time = 0;
     }
     return YES;
@@ -2407,7 +2417,10 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
    this only says what to show next. Whatever is newest when a drawable comes is what is shown. */
 - (void)kickPresenter:(BOOL)fresh {
     /* screen_lock held */
-    if (fresh) screen_requests++;
+    if (fresh) {
+        screen_requests++;
+        last_screen_kick = now_seconds();
+    }
     if (presenter_running || !layer || !screen_tex || drawable_retry_pending) return;
     if (drawable_retry_cooldown) {
         double delay = drawable_retry_cooldown - now_seconds();
@@ -2487,11 +2500,19 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
         screen_dirty = NO;
         CAMetalLayer *target = layer; // retained across nextDrawable and a concurrent disconnect
         uint64_t generation = layer_generation, requests = screen_requests;
+        double requested_at = last_screen_kick;
         id<MTLTexture> tex = screen_tex, ctex = cursor_tex;
         BOOL half = screen_half, shown = cursor_shown;
         uint32_t W = screen_w, H = screen_h, cw0 = cursor_w, ch0 = cursor_h;
         int hx = cursor_hot_x, hy = cursor_hot_y;
         os_unfair_lock_unlock(&screen_lock);
+        double screen_delay = now_seconds() - requested_at;
+        if (requested_at > 0 && screen_delay >= 0) {
+            uint64_t ns = (uint64_t)(screen_delay * 1e9);
+            atomic_fetch_add(&screen_start_count, 1);
+            atomic_fetch_add(&screen_start_ns, ns);
+            metric_max_u64(&screen_start_max_ns, ns);
+        }
         if (![self prepareScreenForLayer:target]) {
             os_unfair_lock_lock(&screen_lock);
             BOOL changed = layer_generation != generation;
