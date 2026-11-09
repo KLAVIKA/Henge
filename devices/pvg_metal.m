@@ -2021,7 +2021,9 @@ typedef struct {
 
 /* One exec: {task, resources, buffers}, {ref, flags} per resource, {offset, length} per buffer. */
 /* Commits without waiting: the next batch can be encoded while the GPU does this one. */
-- (void)commit:(id<MTLCommandBuffer>)cb channel:(uint32_t)ch stamp:(uint32_t)stamp complete:(BOOL)complete {
+- (void)commit:(id<MTLCommandBuffer>)cb channel:(uint32_t)ch stamp:(uint32_t)stamp complete:(BOOL)complete
+             task:(uint32_t)task execID:(uint64_t)execID resources:(uint32_t)nres buffers:(uint32_t)nbuf
+       payloadBytes:(uint64_t)payloadBytes draws:(uint64_t)drawCount encodeMs:(double)encodeMs {
     static int sync = -1; /* HV_PVG_SYNC: wait for the GPU after every batch */
     if (sync < 0) sync = getenv("HV_PVG_SYNC") != NULL;
     HvPvgLite *l = lite;
@@ -2033,13 +2035,23 @@ typedef struct {
         atomic_fetch_add(&self->gpu_cb_done, 1);
         if (completed_at >= submitted_at)
             atomic_fetch_add(&self->gpu_cb_latency_ns, (uint64_t)((completed_at - submitted_at) * 1e9));
+        double gpu_ms = 0;
         if (done.GPUStartTime > 0 && done.GPUEndTime >= done.GPUStartTime) {
             uint64_t ns = (uint64_t)((done.GPUEndTime - done.GPUStartTime) * 1e9);
+            gpu_ms = (double)ns / 1e6;
             atomic_fetch_add(&self->gpu_cb_runtime_ns, ns);
             metric_max_u64(&self->gpu_cb_runtime_max_ns, ns);
         }
+        double submit_ms = completed_at >= submitted_at ? (completed_at - submitted_at) * 1000.0 : 0;
         if (completed_at >= submitted_at)
-            metric_max_u64(&self->gpu_cb_latency_max_ns, (uint64_t)((completed_at - submitted_at) * 1e9));
+            metric_max_u64(&self->gpu_cb_latency_max_ns, (uint64_t)(submit_ms * 1e6));
+        /* Attribute outlier GPU work to the exact guest exec that submitted it. */
+        if (execID && (gpu_ms >= 16.0 || submit_ms >= 50.0)) {
+            fprintf(stderr, "hengevm: pvg-metal: slow-gpu task %u exec %llu ch %u stamp 0x%x GPU %.2f ms submit-to-done %.2f ms encode %.2f ms resources %u buffers %u payload %llu bytes draws %llu inflight-at-submit %d status %lu error %s\n",
+                    task, (unsigned long long)execID, ch, stamp, gpu_ms, submit_ms, encodeMs,
+                    nres, nbuf, (unsigned long long)payloadBytes, (unsigned long long)drawCount, pending,
+                    (unsigned long)done.status, done.error ? done.error.localizedDescription.UTF8String : "none");
+        }
         if (done.error) {
             atomic_fetch_add(&self->gpu_cb_errors, 1);
             self->failed++;
@@ -2059,7 +2071,7 @@ typedef struct {
         hv_pvg_lite_complete(lite, ch, stamp);
         return;
     }
-    [self commit:[queue commandBuffer] channel:ch stamp:stamp complete:YES];
+    [self commit:[queue commandBuffer] channel:ch stamp:stamp complete:YES task:0 execID:0 resources:0 buffers:0 payloadBytes:0 draws:0 encodeMs:0];
 }
 
 /* Returns YES if the GPU's completion gives the stamp back. */
@@ -2076,6 +2088,7 @@ typedef struct {
     if (!trace_checked) trace_checked = YES, trace_file = getenv("HV_PVG_TRACE_FILE");
     tracing = trace_file && access(trace_file, F_OK) == 0;
     if (tracing) fprintf(stderr, "trace: exec task %u, %u resources, %u buffers\n", task, nres, nbuf);
+    uint64_t execID = execs + 1, drawsBefore = draws, payloadBytes = 0;
     double t_begin = now_seconds();
     id<MTLCommandBuffer> cb = [queue commandBuffer];
     id<MTLBlitCommandEncoder> blit = nil;
@@ -2113,6 +2126,7 @@ typedef struct {
         uint64_t off, blen;
         memcpy(&off, bufs + b * 16, 8);
         memcpy(&blen, bufs + b * 16 + 8, 8);
+        if (UINT64_MAX - payloadBytes >= blen) payloadBytes += blen; else payloadBytes = UINT64_MAX;
         if (blen > (64u << 20) || blen < 8) continue;
         NSMutableData *copy = [NSMutableData dataWithLength:(NSUInteger)blen];
         if (hv_pvg_lite_task_read(lite, task, off, copy.mutableBytes, (uint32_t)blen)) { [self complain:@"command buffer unreadable"]; continue; }
@@ -2187,11 +2201,19 @@ typedef struct {
     }
     double t1 = now_seconds();
     double exec_encode = t1 - t_begin;
+    double exec_encode_ms = exec_encode * 1000.0;
+    uint64_t drawCount = draws - drawsBefore;
     if (exec_encode > max_exec_encode_time) max_exec_encode_time = exec_encode;
     if (exec_encode > 0.250) exec_over_250ms++;
     else if (exec_encode > 0.100) exec_over_100ms++;
     else if (exec_encode > 0.050) exec_over_50ms++;
-    [self commit:cb channel:ch stamp:stamp complete:YES];
+    if (exec_encode >= 0.016) {
+        fprintf(stderr, "hengevm: pvg-metal: slow-exec task %u exec %llu ch %u stamp 0x%x encode %.2f ms bytes %u resources %u buffers %u payload %llu bytes draws %llu\n",
+                task, (unsigned long long)execID, ch, stamp, exec_encode_ms, len, nres, nbuf,
+                (unsigned long long)payloadBytes, (unsigned long long)drawCount);
+    }
+    [self commit:cb channel:ch stamp:stamp complete:YES task:task execID:execID resources:nres buffers:nbuf
+      payloadBytes:payloadBytes draws:drawCount encodeMs:exec_encode_ms];
     double t2 = now_seconds();
     encode_time += exec_encode, gpu_wait_time += t2 - t1;
     if (++execs % 1000 == 0) {
