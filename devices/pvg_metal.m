@@ -141,6 +141,14 @@ enum { OBJ_BUFFER = 1, OBJ_TEXTURE = 2, OBJ_FUNCTION = 6, OBJ_SERIALIZED = 7, OB
     /* Work the GPU has not finished. Stamps are given back in the order they came: the
        GPU's completion handlers run in the order of commit. */
     _Atomic int inflight;
+    _Atomic int queued_work, max_queued_work;
+    _Atomic uint64_t worker_queue_wait_count, worker_queue_wait_ns, worker_queue_wait_max_ns;
+    _Atomic uint64_t gpu_cb_done, gpu_cb_errors, gpu_cb_runtime_ns, gpu_cb_latency_ns;
+    _Atomic uint64_t present_drawable_wait_count, present_drawable_wait_ns, present_drawable_wait_max_ns;
+    _Atomic uint64_t present_no_drawable, present_encode_count, present_encode_ns;
+    _Atomic uint64_t present_submit_count, present_done_count, present_gpu_runtime_ns, present_gpu_latency_ns;
+    _Atomic uint64_t present_interval_count, present_interval_ns;
+    double last_present_submit; /* presenter-queue owned */
     id<MTLCommandBuffer> last_cb;
     double encode_time, gpu_wait_time;
     BOOL pipeline_set; /* in the open encoder */
@@ -208,6 +216,20 @@ enum { OBJ_BUFFER = 1, OBJ_TEXTURE = 2, OBJ_FUNCTION = 6, OBJ_SERIALIZED = 7, OB
 
 static double now_seconds(void) {
     return (double)clock_gettime_nsec_np(CLOCK_MONOTONIC) * 1e-9;
+}
+
+static void metric_max_u64(_Atomic uint64_t *slot, uint64_t value) {
+    uint64_t old = atomic_load_explicit(slot, memory_order_relaxed);
+    while (old < value &&
+           !atomic_compare_exchange_weak_explicit(slot, &old, value,
+                                                  memory_order_relaxed, memory_order_relaxed)) {}
+}
+
+static void metric_max_int(_Atomic int *slot, int value) {
+    int old = atomic_load_explicit(slot, memory_order_relaxed);
+    while (old < value &&
+           !atomic_compare_exchange_weak_explicit(slot, &old, value,
+                                                  memory_order_relaxed, memory_order_relaxed)) {}
 }
 
 /* How the half-float display surface is shown. WindowServer writes DISPLAY-ENCODED values there (extended sRGB: the guest's gray 128 is
@@ -1998,8 +2020,16 @@ typedef struct {
     if (sync < 0) sync = getenv("HV_PVG_SYNC") != NULL;
     HvPvgLite *l = lite;
     atomic_fetch_add(&inflight, 1);
+    double submitted_at = now_seconds();
     [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        double completed_at = now_seconds();
+        atomic_fetch_add(&self->gpu_cb_done, 1);
+        if (completed_at >= submitted_at)
+            atomic_fetch_add(&self->gpu_cb_latency_ns, (uint64_t)((completed_at - submitted_at) * 1e9));
+        if (done.GPUStartTime > 0 && done.GPUEndTime >= done.GPUStartTime)
+            atomic_fetch_add(&self->gpu_cb_runtime_ns, (uint64_t)((done.GPUEndTime - done.GPUStartTime) * 1e9));
         if (done.error) {
+            atomic_fetch_add(&self->gpu_cb_errors, 1);
             self->failed++;
             fprintf(stderr, "hengevm: pvg-metal: command buffer: %s\n", done.error.localizedDescription.UTF8String);
         }
@@ -2147,16 +2177,45 @@ typedef struct {
     [self commit:cb channel:ch stamp:stamp complete:YES];
     double t2 = now_seconds();
     encode_time += t1 - t_begin, gpu_wait_time += t2 - t1;
-    if (++execs % 2000 == 0) {
+    if (++execs % 1000 == 0) {
         static double t0;
         if (!t0) t0 = now_seconds();
-        fprintf(stderr, "hengevm: pvg-metal: %llu execs, %llu draws, %llu failed, %llu synced, %llu remaps, %.0f s; encoding %.2f s, waiting for the GPU %.2f s; pipeline totals render %llu/%llu tile %llu/%llu compute %llu/%llu; draws skipped-no-pipeline %llu\n",
+        uint64_t qn = atomic_exchange(&worker_queue_wait_count, 0);
+        uint64_t qsum = atomic_exchange(&worker_queue_wait_ns, 0);
+        uint64_t qmax = atomic_exchange(&worker_queue_wait_max_ns, 0);
+        uint64_t gdn = atomic_exchange(&gpu_cb_done, 0);
+        uint64_t ger = atomic_exchange(&gpu_cb_errors, 0);
+        uint64_t grun = atomic_exchange(&gpu_cb_runtime_ns, 0);
+        uint64_t glat = atomic_exchange(&gpu_cb_latency_ns, 0);
+        uint64_t dwn = atomic_exchange(&present_drawable_wait_count, 0);
+        uint64_t dws = atomic_exchange(&present_drawable_wait_ns, 0);
+        uint64_t dwm = atomic_exchange(&present_drawable_wait_max_ns, 0);
+        uint64_t dnf = atomic_exchange(&present_no_drawable, 0);
+        uint64_t pen = atomic_exchange(&present_encode_count, 0);
+        uint64_t pes = atomic_exchange(&present_encode_ns, 0);
+        uint64_t psn = atomic_exchange(&present_submit_count, 0);
+        uint64_t pdn = atomic_exchange(&present_done_count, 0);
+        uint64_t pgr = atomic_exchange(&present_gpu_runtime_ns, 0);
+        uint64_t pgl = atomic_exchange(&present_gpu_latency_ns, 0);
+        uint64_t pin = atomic_exchange(&present_interval_count, 0);
+        uint64_t pis = atomic_exchange(&present_interval_ns, 0);
+        fprintf(stderr, "hengevm: pvg-metal: %llu execs, %llu draws, %llu failed, %llu synced, %llu remaps, %.0f s; encoding %.2f s, submit %.2f s; pipeline render %llu/%llu tile %llu/%llu compute %llu/%llu; skipped %llu\n",
                 (unsigned long long)execs, (unsigned long long)draws, (unsigned long long)failed,
                 (unsigned long long)synced, (unsigned long long)remaps, now_seconds() - t0,
                 encode_time, gpu_wait_time, (unsigned long long)render_pipeline_ok,
                 (unsigned long long)render_pipeline_failed, (unsigned long long)tile_pipeline_ok,
                 (unsigned long long)tile_pipeline_failed, (unsigned long long)compute_pipeline_ok,
                 (unsigned long long)compute_pipeline_failed, (unsigned long long)draws_skipped_no_pipeline);
+        fprintf(stderr, "hengevm: pvg-timing: workerQ avg %.2f ms max %.2f ms depth %d; GPU cmd done %llu errors %llu avg-run %.2f ms avg-submit-to-done %.2f ms inflight %d\n",
+                qn ? (double)qsum / qn / 1e6 : 0.0, (double)qmax / 1e6,
+                atomic_exchange(&max_queued_work, 0), (unsigned long long)gdn, (unsigned long long)ger,
+                gdn ? (double)grun / gdn / 1e6 : 0.0, gdn ? (double)glat / gdn / 1e6 : 0.0,
+                atomic_load(&inflight));
+        fprintf(stderr, "hengevm: pvg-present: drawable avg %.2f ms max %.2f ms nil %llu; encode avg %.2f ms; submitted %llu completed %llu GPU-run %.2f ms submit-to-done %.2f ms frame-submit-interval %.2f ms total-frames %llu\n",
+                dwn ? (double)dws / dwn / 1e6 : 0.0, (double)dwm / 1e6, (unsigned long long)dnf,
+                pen ? (double)pes / pen / 1e6 : 0.0, (unsigned long long)psn, (unsigned long long)pdn,
+                pdn ? (double)pgr / pdn / 1e6 : 0.0, pdn ? (double)pgl / pdn / 1e6 : 0.0,
+                pin ? (double)pis / pin / 1e6 : 0.0, (unsigned long long)atomic_load(&gpu_frames));
         encode_time = gpu_wait_time = 0;
     }
     return YES;
@@ -2419,8 +2478,17 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
             target.drawableSize = want;
             [CATransaction commit];
         }
+        double drawable_wait_start = now_seconds();
         id<CAMetalDrawable> drawable = [target nextDrawable]; /* the wait is here */
+        double drawable_wait = now_seconds() - drawable_wait_start;
+        if (drawable_wait >= 0) {
+            uint64_t ns = (uint64_t)(drawable_wait * 1e9);
+            atomic_fetch_add(&present_drawable_wait_count, 1);
+            atomic_fetch_add(&present_drawable_wait_ns, ns);
+            metric_max_u64(&present_drawable_wait_max_ns, ns);
+        }
         if (!drawable) {
+            atomic_fetch_add(&present_no_drawable, 1);
             os_unfair_lock_lock(&screen_lock);
             screen_dirty = YES;
             BOOL changed = layer_generation != generation;
@@ -2469,6 +2537,7 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
             os_unfair_lock_unlock(&screen_lock);
             continue;
         }
+        double present_encode_start = now_seconds();
         id<MTLCommandBuffer> cb = [queue commandBuffer];
         MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
         pass.colorAttachments[0].texture = drawable.texture;
@@ -2524,8 +2593,30 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
 #endif
         // Serialize the final check and commit with set_layer: a switch that has
         // returned must not be followed by a commit to its old target.
+        double present_encode_end = now_seconds();
+        uint64_t present_encode_ns = present_encode_end >= present_encode_start
+            ? (uint64_t)((present_encode_end - present_encode_start) * 1e9) : 0;
         os_unfair_lock_lock(&screen_lock);
         if (layer_generation == generation && layer == target) {
+            double present_submitted_at = now_seconds();
+            if (present_encode_ns) {
+                atomic_fetch_add(&present_encode_count, 1);
+                atomic_fetch_add(&present_encode_ns, present_encode_ns);
+            }
+            if (last_present_submit > 0 && present_submitted_at >= last_present_submit) {
+                atomic_fetch_add(&present_interval_count, 1);
+                atomic_fetch_add(&present_interval_ns, (uint64_t)((present_submitted_at - last_present_submit) * 1e9));
+            }
+            last_present_submit = present_submitted_at;
+            atomic_fetch_add(&present_submit_count, 1);
+            [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+                double completed_at = now_seconds();
+                atomic_fetch_add(&self->present_done_count, 1);
+                if (completed_at >= present_submitted_at)
+                    atomic_fetch_add(&self->present_gpu_latency_ns, (uint64_t)((completed_at - present_submitted_at) * 1e9));
+                if (done.GPUStartTime > 0 && done.GPUEndTime >= done.GPUStartTime)
+                    atomic_fetch_add(&self->present_gpu_runtime_ns, (uint64_t)((done.GPUEndTime - done.GPUStartTime) * 1e9));
+            }];
             [cb presentDrawable:drawable];
             [cb commit];
             gpu_frames++;
@@ -2675,8 +2766,19 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
 
 void hv_pvg_metal_submit(HvPvgMetal *m, HvPvgLite *lite, uint32_t ch, uint64_t sequence, uint32_t *cmd, uint32_t len) {
     HvReplay *r = (__bridge HvReplay *)m;
+    double queued_at = now_seconds();
+    int queued = atomic_fetch_add(&r->queued_work, 1) + 1;
+    metric_max_int(&r->max_queued_work, queued);
     dispatch_async(r->worker, ^{
         @autoreleasepool {
+            atomic_fetch_sub(&r->queued_work, 1);
+            double queue_delay = now_seconds() - queued_at;
+            if (queue_delay >= 0) {
+                uint64_t ns = (uint64_t)(queue_delay * 1e9);
+                atomic_fetch_add(&r->worker_queue_wait_count, 1);
+                atomic_fetch_add(&r->worker_queue_wait_ns, ns);
+                metric_max_u64(&r->worker_queue_wait_max_ns, ns);
+            }
             r->event_sequence = sequence;
             uint32_t op = cmd[0] & 0xffff, skip = (cmd[0] >> 16) * 8;
             static unsigned worker_start_logs;
