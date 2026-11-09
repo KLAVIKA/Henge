@@ -279,6 +279,7 @@ static int bc_read_abbrev_record(HvBCReader *r, const HvBCAbbrev *a, uint8_t *by
     int is_triple = first.value == 2;
     HvBCValue values[BC_MAX_TRIPLE];
     size_t kept = 0;
+    int overflow = 0;
     for (unsigned i = 1; i < a->count; i++) {
         const HvBCOp *op = &a->ops[i];
         if (op->kind == BC_ARRAY) {
@@ -289,7 +290,10 @@ static int bc_read_abbrev_record(HvBCReader *r, const HvBCAbbrev *a, uint8_t *by
             for (uint64_t j = 0; j < n; j++) {
                 HvBCValue v;
                 if (!bc_read_scalar(r, element, &v)) return -1;
-                if (is_triple && kept < BC_MAX_TRIPLE) values[kept++] = v;
+                if (is_triple) {
+                    if (kept < BC_MAX_TRIPLE) values[kept++] = v;
+                    else overflow = 1;
+                }
             }
             if (i + 1 != a->count) return -1;
             break;
@@ -303,7 +307,10 @@ static int bc_read_abbrev_record(HvBCReader *r, const HvBCAbbrev *a, uint8_t *by
                 v.kind = BC_BLOB, v.width = 8, v.writable = 1, v.start = r->bit;
                 v.value = bc_read_bits(r, 8);
                 v.end = r->bit;
-                if (is_triple && kept < BC_MAX_TRIPLE) values[kept++] = v;
+                if (is_triple) {
+                    if (kept < BC_MAX_TRIPLE) values[kept++] = v;
+                    else overflow = 1;
+                }
                 if (r->bad) return -1;
             }
             bc_align32(r);
@@ -312,10 +319,13 @@ static int bc_read_abbrev_record(HvBCReader *r, const HvBCAbbrev *a, uint8_t *by
         } else {
             HvBCValue v;
             if (!bc_read_scalar(r, op, &v)) return -1;
-            if (is_triple && kept < BC_MAX_TRIPLE) values[kept++] = v;
+            if (is_triple) {
+                if (kept < BC_MAX_TRIPLE) values[kept++] = v;
+                else overflow = 1;
+            }
         }
     }
-    return is_triple ? bc_apply_triple(bytes, r->limit, values, kept,
+    return is_triple && !overflow ? bc_apply_triple(bytes, r->limit, values, kept,
                                        sample_before, sample_before_size, sample_after, sample_after_size) : 0;
 }
 
