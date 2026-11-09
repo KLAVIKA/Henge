@@ -2436,8 +2436,12 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
 
 /* What the display should show: at most a few times a second by CPU, for tests and the boot's first frames. */
 - (void)present:(uint64_t)mapping {
+    static unsigned present_logs;
     double now = now_seconds();
     on_screen = mapping;
+    if (present_logs++ < 32)
+        fprintf(stderr, "hengevm: pvg-metal: present mapping %llu layer %d surfaces %lu\n",
+                (unsigned long long)mapping, [self hasDisplayLayer], (unsigned long)surfaces.count);
     if ([self hasDisplayLayer]) {
         late = NO;
         [self showOnLayer:mapping];
@@ -2456,7 +2460,17 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
     }
     late = NO;
     HvObject *surface = surfaces[@(mapping)];
-    if (!surface) { [self complain:[NSString stringWithFormat:@"swap to unknown surface %llu", mapping]]; return; }
+    if (!surface) {
+        static unsigned unknown_cpu;
+        if (unknown_cpu++ < 32) {
+            NSMutableString *keys = [NSMutableString new];
+            for (NSNumber *key in surfaces) [keys appendFormat:@"%@,", key];
+            fprintf(stderr, "hengevm: pvg-metal: CPU display lookup missing mapping %llu; registered count %lu keys [%s]\n",
+                    (unsigned long long)mapping, (unsigned long)surfaces.count, keys.UTF8String);
+        }
+        [self complain:[NSString stringWithFormat:@"swap to unknown surface %llu", mapping]];
+        return;
+    }
     last_capture = now;
     [last_cb waitUntilCompleted]; /* the CPU copies the pixels here, so the GPU must be done with them */
     NSUInteger bpp = surface->fourcc == 'RGhA' ? 8 : 4, row = surface->row;
@@ -2572,7 +2586,9 @@ void hv_pvg_metal_submit(HvPvgMetal *m, HvPvgLite *lite, uint32_t ch, uint32_t *
                         uint32_t task = args[0], nres = args[1], nbuf = args[2];
                         NSMutableString *refs = [NSMutableString new];
                         const uint32_t *res = args + 3;
-                        for (uint32_t i = 0; i < MIN(nres, 12u); i++)
+                        uint32_t available = n >= 12 ? (n - 12) / 8 : 0;
+                        uint32_t shown = MIN(MIN(nres, 12u), available);
+                        for (uint32_t i = 0; i < shown; i++)
                             [refs appendFormat:@"%@%u", i ? @"," : @"", res[i * 2]];
                         fprintf(stderr, "hengevm: pvg-metal: exec op %#x channel %u task %u resources %u buffers %u refs [%s]\n",
                                 op, ch, task, nres, nbuf, refs.UTF8String);
