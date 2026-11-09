@@ -21,39 +21,432 @@ static uint32_t rd32(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1] 
 static uint64_t rd64(const uint8_t *p) { return (uint64_t)rd32(p) | (uint64_t)rd32(p + 4) << 32; }
 static void wr16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)v, p[1] = (uint8_t)(v >> 8); }
 
-/* "air64_vNN-apple-macosxA.B.C" in [p, end) becomes "air64_v26-apple-ios17...." of the same length. */
-static int relabel_triple(uint8_t *p, size_t n, char *sample_before, size_t sample_before_size, char *sample_after, size_t sample_after_size) {
-    static const char key[] = "-apple-macosx";
-    int changed = 0;
-    for (size_t i = 9; i + sizeof key - 1 < n; i++) {
-        if (memcmp(p + i, key, sizeof key - 1) != 0) continue;
-        if (memcmp(p + i - 9, "air64_v", 7) != 0) continue;
-        size_t v = i + sizeof key - 1, e = v; /* the version: digits and dots */
-        while (e < n && ((p[e] >= '0' && p[e] <= '9') || p[e] == '.')) e++;
-        size_t len = e - (i + 7); /* "macosx" + version */
-        size_t triple_len = e - (i - 9);
-        if (sample_before && sample_before_size && !sample_before[0]) {
-            size_t copy = triple_len < sample_before_size - 1 ? triple_len : sample_before_size - 1;
-            memcpy(sample_before, p + i - 9, copy);
-            sample_before[copy] = 0;
+
+/* LLVM bitcode is a bitstream, not a byte string: MODULE_CODE_TRIPLE strings are
+   VBR/Char6/Blob operands inside MODULE_BLOCK. Decode the bitstream and patch
+   the character operands in place so their encoded lengths and block offsets
+   remain unchanged. */
+enum { BC_LITERAL, BC_FIXED, BC_VBR, BC_ARRAY, BC_CHAR6, BC_BLOB };
+#define BC_MAX_OPS 32
+#define BC_MAX_ABBREVS 128
+#define BC_MAX_TRIPLE 256
+
+typedef struct {
+    unsigned kind, width;
+    uint64_t literal;
+} HvBCOp;
+
+typedef struct {
+    unsigned count;
+    HvBCOp ops[BC_MAX_OPS];
+} HvBCAbbrev;
+
+typedef struct {
+    uint8_t *bytes;
+    size_t bit, limit;
+    int bad;
+} HvBCReader;
+
+typedef struct {
+    uint64_t value;
+    size_t start, end;
+    unsigned kind, width;
+    int writable;
+} HvBCValue;
+
+static uint64_t bc_read_bits(HvBCReader *r, unsigned width) {
+    if (width > 64 || r->bit > r->limit || width > r->limit - r->bit) {
+        r->bad = 1;
+        return 0;
+    }
+    uint64_t value = 0;
+    for (unsigned i = 0; i < width; i++)
+        value |= (uint64_t)((r->bytes[(r->bit + i) >> 3] >> ((r->bit + i) & 7)) & 1) << i;
+    r->bit += width;
+    return value;
+}
+
+static int bc_write_bits(uint8_t *bytes, size_t limit, size_t bit, unsigned width, uint64_t value) {
+    if (width > 64 || bit > limit || width > limit - bit) return 0;
+    for (unsigned i = 0; i < width; i++) {
+        uint8_t mask = (uint8_t)(1u << ((bit + i) & 7));
+        uint8_t *p = &bytes[(bit + i) >> 3];
+        if ((value >> i) & 1) *p |= mask;
+        else *p &= (uint8_t)~mask;
+    }
+    return 1;
+}
+
+static uint64_t bc_read_vbr(HvBCReader *r, unsigned width) {
+    if (width < 2 || width > 32) { r->bad = 1; return 0; }
+    unsigned payload = width - 1, shift = 0;
+    uint64_t value = 0;
+    for (unsigned groups = 0; groups < 13; groups++) {
+        uint64_t part = bc_read_bits(r, width);
+        if (r->bad) return 0;
+        uint64_t piece = part & ((1ull << payload) - 1);
+        if (shift >= 64 || (shift && piece > (UINT64_MAX >> shift))) {
+            r->bad = 1;
+            return 0;
         }
+        value |= piece << shift;
+        if (!(part & (1ull << payload))) return value;
+        shift += payload;
+    }
+    r->bad = 1;
+    return 0;
+}
+
+static void bc_align32(HvBCReader *r) {
+    size_t next = (r->bit + 31u) & ~(size_t)31u;
+    if (next > r->limit) r->bad = 1;
+    else r->bit = next;
+}
+
+static int bc_read_abbrev(HvBCReader *r, HvBCAbbrev *a) {
+    uint64_t n = bc_read_vbr(r, 5);
+    if (r->bad || n == 0 || n > BC_MAX_OPS) return 0;
+    memset(a, 0, sizeof(*a));
+    a->count = (unsigned)n;
+    for (unsigned i = 0; i < a->count; i++) {
+        HvBCOp *op = &a->ops[i];
+        if (bc_read_bits(r, 1)) {
+            op->kind = BC_LITERAL;
+            op->literal = bc_read_vbr(r, 8);
+        } else {
+            op->kind = (unsigned)bc_read_bits(r, 3);
+            if (op->kind == BC_FIXED || op->kind == BC_VBR)
+                op->width = (unsigned)bc_read_vbr(r, 5);
+            if (op->kind < BC_FIXED || op->kind > BC_BLOB ||
+                ((op->kind == BC_FIXED || op->kind == BC_VBR) &&
+                 (!op->width || op->width > 32))) r->bad = 1;
+        }
+        if (r->bad) return 0;
+    }
+    return 1;
+}
+
+static int bc_char6(uint64_t v) {
+    if (v < 26) return 'a' + (int)v;
+    if (v < 52) return 'A' + (int)(v - 26);
+    if (v < 62) return '0' + (int)(v - 52);
+    if (v == 62) return '.';
+    if (v == 63) return '_';
+    return -1;
+}
+
+static int bc_char6_value(unsigned char c) {
+    if (c >= 'a' && c <= 'z') return c - 'a';
+    if (c >= 'A' && c <= 'Z') return c - 'A' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '.') return 62;
+    if (c == '_') return 63;
+    return -1;
+}
+
+static int bc_read_scalar(HvBCReader *r, const HvBCOp *op, HvBCValue *v) {
+    memset(v, 0, sizeof(*v));
+    v->kind = op->kind;
+    v->width = op->width;
+    v->writable = op->kind != BC_LITERAL;
+    v->start = r->bit;
+    if (op->kind == BC_LITERAL) v->value = op->literal;
+    else if (op->kind == BC_FIXED) v->value = bc_read_bits(r, op->width);
+    else if (op->kind == BC_VBR) v->value = bc_read_vbr(r, op->width);
+    else if (op->kind == BC_CHAR6) {
+        int c = bc_char6(bc_read_bits(r, 6));
+        if (c < 0) r->bad = 1;
+        else v->value = (uint64_t)c;
+        v->width = 6;
+    } else {
+        r->bad = 1;
+    }
+    v->end = r->bit;
+    return !r->bad;
+}
+
+static int bc_write_char(uint8_t *bytes, size_t limit, const HvBCValue *v, unsigned char c) {
+    if (!v->writable) return 0;
+    if (v->kind == BC_FIXED || v->kind == BC_BLOB) {
+        unsigned width = v->kind == BC_BLOB ? 8 : v->width;
+        if (width < 8 && c >= (1u << width)) return 0;
+        return bc_write_bits(bytes, limit, v->start, width, c);
+    }
+    if (v->kind == BC_CHAR6) {
+        int x = bc_char6_value(c);
+        return x >= 0 && bc_write_bits(bytes, limit, v->start, 6, (uint64_t)x);
+    }
+    if (v->kind == BC_VBR) {
+        unsigned width = v->width, payload = width - 1;
+        size_t bits = v->end - v->start;
+        if (!width || bits % width) return 0;
+        size_t groups = bits / width;
+        if (!groups || groups > 13 ||
+            (groups * payload < 64 && ((uint64_t)c >> (groups * payload)))) return 0;
+        uint64_t mask = (1ull << payload) - 1;
+        for (size_t i = 0; i < groups; i++) {
+            uint64_t part = ((uint64_t)c >> (i * payload)) & mask;
+            if (i + 1 < groups) part |= 1ull << payload;
+            if (!bc_write_bits(bytes, limit, v->start + i * width, width, part)) return 0;
+        }
+        return 1;
+    }
+    return 0;
+}
+
+static int bc_apply_triple(uint8_t *bytes, size_t limit, HvBCValue *values, size_t count,
+                           char *sample_before, size_t sample_before_size,
+                           char *sample_after, size_t sample_after_size) {
+    if (!count || count > BC_MAX_TRIPLE) return 0;
+    char text[BC_MAX_TRIPLE];
+    for (size_t i = 0; i < count; i++) {
+        if (values[i].value > 127) return 0;
+        text[i] = (char)values[i].value;
+    }
+    size_t text_len = count;
+    while (text_len && text[text_len - 1] == 0) text_len--;
+    int changed = 0;
+    static const char key[] = "-apple-macosx";
+    for (size_t i = 9; i + sizeof(key) - 1 <= text_len; i++) {
+        if (memcmp(text + i, key, sizeof(key) - 1) != 0) continue;
+        if (memcmp(text + i - 9, "air64_v", 7) != 0 ||
+            text[i - 2] < '0' || text[i - 2] > '9' ||
+            text[i - 1] < '0' || text[i - 1] > '9') continue;
+        size_t suffix = i + 7;
+        size_t suffix_len = text_len - suffix;
+        if (suffix_len < 12 || suffix_len >= 64) continue;
         char out[64];
-        size_t rest = len - 6; /* after "ios17.": "ios17.0.0" needs room for two parts */
-        if (len < 12 || len >= sizeof out) continue;
-        p[i - 2] = '2', p[i - 1] = '6';
+        size_t rest = suffix_len - 6;
         memcpy(out, "ios17.", 6);
-        size_t a = rest / 2; /* "0..0" "." "0..0" */
         memset(out + 6, '0', rest);
-        out[6 + a] = '.';
-        memcpy(p + i + 7, out, len);
-        if (sample_after && sample_after_size && sample_before && sample_before[0] && !sample_after[0]) {
-            size_t copy = triple_len < sample_after_size - 1 ? triple_len : sample_after_size - 1;
-            memcpy(sample_after, p + i - 9, copy);
-            sample_after[copy] = 0;
+        out[6 + rest / 2] = '.';
+        int can_write = values[i - 2].writable && values[i - 1].writable;
+        for (size_t j = 0; j < suffix_len; j++)
+            if (!values[suffix + j].writable) can_write = 0;
+        if (!can_write) continue;
+        if (sample_before && sample_before_size && !sample_before[0]) {
+            size_t n = text_len - (i - 9);
+            if (n >= sample_before_size) n = sample_before_size - 1;
+            memcpy(sample_before, text + i - 9, n);
+            sample_before[n] = 0;
+        }
+        if (!bc_write_char(bytes, limit, &values[i - 2], '2') ||
+            !bc_write_char(bytes, limit, &values[i - 1], '6')) continue;
+        for (size_t j = 0; j < suffix_len; j++) {
+            if (!bc_write_char(bytes, limit, &values[suffix + j], (unsigned char)out[j]))
+                return changed;
+            text[suffix + j] = out[j];
+        }
+        text[i - 2] = '2', text[i - 1] = '6';
+        if (sample_after && sample_after_size && !sample_after[0]) {
+            size_t n = text_len - (i - 9);
+            if (n >= sample_after_size) n = sample_after_size - 1;
+            memcpy(sample_after, text + i - 9, n);
+            sample_after[n] = 0;
         }
         changed++;
     }
     return changed;
+}
+
+static int bc_read_unabbrev_record(HvBCReader *r, uint8_t *bytes,
+                                   char *sample_before, size_t sample_before_size,
+                                   char *sample_after, size_t sample_after_size) {
+    uint64_t code = bc_read_vbr(r, 6), count = bc_read_vbr(r, 6);
+    if (r->bad || count > 1000000) return -1;
+    HvBCValue values[BC_MAX_TRIPLE];
+    size_t kept = 0;
+    for (uint64_t i = 0; i < count; i++) {
+        HvBCValue v;
+        memset(&v, 0, sizeof(v));
+        v.kind = BC_VBR, v.width = 6, v.writable = 1, v.start = r->bit;
+        v.value = bc_read_vbr(r, 6);
+        v.end = r->bit;
+        if (code == 2 && kept < BC_MAX_TRIPLE) values[kept++] = v;
+        if (r->bad) return -1;
+    }
+    return code == 2 && count == kept
+        ? bc_apply_triple(bytes, r->limit, values, kept, sample_before, sample_before_size, sample_after, sample_after_size)
+        : 0;
+}
+
+static int bc_read_abbrev_record(HvBCReader *r, const HvBCAbbrev *a, uint8_t *bytes,
+                                 char *sample_before, size_t sample_before_size,
+                                 char *sample_after, size_t sample_after_size) {
+    if (!a->count) return -1;
+    HvBCValue first;
+    if (!bc_read_scalar(r, &a->ops[0], &first)) return -1;
+    int is_triple = first.value == 2;
+    HvBCValue values[BC_MAX_TRIPLE];
+    size_t kept = 0;
+    for (unsigned i = 1; i < a->count; i++) {
+        const HvBCOp *op = &a->ops[i];
+        if (op->kind == BC_ARRAY) {
+            if (++i >= a->count) return -1;
+            const HvBCOp *element = &a->ops[i];
+            uint64_t n = bc_read_vbr(r, 6);
+            if (r->bad || element->kind == BC_ARRAY || element->kind == BC_BLOB) return -1;
+            for (uint64_t j = 0; j < n; j++) {
+                HvBCValue v;
+                if (!bc_read_scalar(r, element, &v)) return -1;
+                if (is_triple && kept < BC_MAX_TRIPLE) values[kept++] = v;
+            }
+            if (i + 1 != a->count) return -1;
+            break;
+        } else if (op->kind == BC_BLOB) {
+            uint64_t n = bc_read_vbr(r, 6);
+            if (r->bad || n > 1000000) return -1;
+            bc_align32(r);
+            for (uint64_t j = 0; j < n; j++) {
+                HvBCValue v;
+                memset(&v, 0, sizeof(v));
+                v.kind = BC_BLOB, v.width = 8, v.writable = 1, v.start = r->bit;
+                v.value = bc_read_bits(r, 8);
+                v.end = r->bit;
+                if (is_triple && kept < BC_MAX_TRIPLE) values[kept++] = v;
+                if (r->bad) return -1;
+            }
+            bc_align32(r);
+            if (r->bad || i + 1 != a->count) return -1;
+            break;
+        } else {
+            HvBCValue v;
+            if (!bc_read_scalar(r, op, &v)) return -1;
+            if (is_triple && kept < BC_MAX_TRIPLE) values[kept++] = v;
+        }
+    }
+    return is_triple ? bc_apply_triple(bytes, r->limit, values, kept,
+                                       sample_before, sample_before_size, sample_after, sample_after_size) : 0;
+}
+
+static int bc_skip_subblock(HvBCReader *r, size_t *body, size_t *end, unsigned *width) {
+    (void)bc_read_vbr(r, 8); /* block id */
+    *width = (unsigned)bc_read_vbr(r, 4);
+    bc_align32(r);
+    uint64_t words = bc_read_bits(r, 32);
+    if (r->bad || *width < 2 || *width > 32 || words > (r->limit - r->bit) / 32) return 0;
+    *body = r->bit;
+    *end = r->bit + (size_t)words * 32;
+    return 1;
+}
+
+static int bc_parse_blockinfo(HvBCReader *r, size_t end, unsigned width,
+                              HvBCAbbrev *module_abbrevs, size_t *module_count) {
+    int target = -1;
+    while (!r->bad && r->bit + width <= end) {
+        uint64_t id = bc_read_bits(r, width);
+        if (id == 0) { bc_align32(r); break; }
+        if (id == 1) {
+            size_t body, subend;
+            unsigned subwidth;
+            if (!bc_skip_subblock(r, &body, &subend, &subwidth)) return 0;
+            r->bit = subend;
+        } else if (id == 2) {
+            HvBCAbbrev a;
+            if (!bc_read_abbrev(r, &a)) return 0;
+            if (target == 8) {
+                if (*module_count >= BC_MAX_ABBREVS) return 0;
+                module_abbrevs[(*module_count)++] = a;
+            }
+        } else if (id == 3) {
+            uint64_t code = bc_read_vbr(r, 6), n = bc_read_vbr(r, 6), first = 0;
+            if (r->bad || n > 1000000) return 0;
+            for (uint64_t i = 0; i < n; i++) {
+                uint64_t v = bc_read_vbr(r, 6);
+                if (i == 0) first = v;
+            }
+            if (code == 1 && n) target = (int)first; /* SETBID */
+        } else {
+            return 0;
+        }
+    }
+    if (r->bad || r->bit > end) return 0;
+    r->bit = end;
+    return 1;
+}
+
+static int bc_parse_module(HvBCReader *r, size_t end, unsigned width,
+                           const HvBCAbbrev *inherited, size_t inherited_count,
+                           uint8_t *bytes, char *sample_before, size_t sample_before_size,
+                           char *sample_after, size_t sample_after_size) {
+    HvBCAbbrev abbrevs[BC_MAX_ABBREVS];
+    size_t abbrev_count = inherited_count;
+    if (abbrev_count > BC_MAX_ABBREVS) return -1;
+    memcpy(abbrevs, inherited, abbrev_count * sizeof(*abbrevs));
+    int changed = 0;
+    while (!r->bad && r->bit + width <= end) {
+        uint64_t id = bc_read_bits(r, width);
+        if (id == 0) { bc_align32(r); break; }
+        if (id == 1) {
+            size_t body, subend;
+            unsigned subwidth;
+            if (!bc_skip_subblock(r, &body, &subend, &subwidth)) return -1;
+            r->bit = subend;
+        } else if (id == 2) {
+            HvBCAbbrev a;
+            if (!bc_read_abbrev(r, &a) || abbrev_count >= BC_MAX_ABBREVS) return -1;
+            abbrevs[abbrev_count++] = a;
+        } else if (id == 3) {
+            int c = bc_read_unabbrev_record(r, bytes, sample_before, sample_before_size, sample_after, sample_after_size);
+            if (c < 0) return -1;
+            changed += c;
+        } else {
+            size_t index = (size_t)id - 4;
+            if (index >= abbrev_count) return -1;
+            int c = bc_read_abbrev_record(r, &abbrevs[index], bytes,
+                                          sample_before, sample_before_size, sample_after, sample_after_size);
+            if (c < 0) return -1;
+            changed += c;
+        }
+        if (r->bit > end) return -1;
+    }
+    if (r->bad || r->bit > end) return -1;
+    return changed;
+}
+
+static int relabel_triple(uint8_t *p, size_t n, char *sample_before, size_t sample_before_size,
+                          char *sample_after, size_t sample_after_size) {
+    /* LLVM bitcode magic. Also accept the standard 20-byte bitcode wrapper. */
+    if (n >= 20 && rd32(p) == 0x0b17c0de) {
+        uint32_t off = rd32(p + 8), size = rd32(p + 12);
+        if (off > n || size > n - off) return -2;
+        p += off, n = size;
+    }
+    if (n < 4 || p[0] != 'B' || p[1] != 'C' || p[2] != 0xc0 || p[3] != 0xde) return -1;
+    HvBCReader r = {p, 32, n * 8, 0};
+    HvBCAbbrev module_abbrevs[BC_MAX_ABBREVS];
+    size_t module_count = 0, module_body = 0, module_end = 0;
+    unsigned module_width = 0;
+    while (!r.bad && r.bit + 2 <= r.limit) {
+        uint64_t id = bc_read_bits(&r, 2);
+        if (id == 0) break;
+        if (id == 1) {
+            uint64_t block_id = bc_read_vbr(&r, 8);
+            unsigned width = (unsigned)bc_read_vbr(&r, 4);
+            bc_align32(&r);
+            uint64_t words = bc_read_bits(&r, 32);
+            if (r.bad || width < 2 || width > 32 || words > (r.limit - r.bit) / 32) return -2;
+            size_t body = r.bit, end = r.bit + (size_t)words * 32;
+            if (block_id == 0) {
+                if (!bc_parse_blockinfo(&r, end, width, module_abbrevs, &module_count)) return -2;
+            } else if (block_id == 8) {
+                module_body = body, module_end = end, module_width = width;
+            }
+            r.bit = end;
+        } else if (id == 2) {
+            HvBCAbbrev ignored;
+            if (!bc_read_abbrev(&r, &ignored)) return -2;
+        } else {
+            (void)bc_read_vbr(&r, 6);
+            uint64_t count = bc_read_vbr(&r, 6);
+            if (r.bad || count > 1000000) return -2;
+            for (uint64_t i = 0; i < count; i++) (void)bc_read_vbr(&r, 6);
+        }
+    }
+    if (r.bad || !module_end || module_end > r.limit || module_body > module_end) return -2;
+    r.bit = module_body, r.limit = module_end, r.bad = 0;
+    return bc_parse_module(&r, module_end, module_width, module_abbrevs, module_count,
+                           p, sample_before, sample_before_size, sample_after, sample_after_size);
 }
 
 int hv_metallib_relabel(uint8_t *buf, size_t len, int stage, int *triple_changes, char *sample_before, size_t sample_before_size, char *sample_after, size_t sample_after_size) {
@@ -62,7 +455,7 @@ int hv_metallib_relabel(uint8_t *buf, size_t len, int stage, int *triple_changes
     if (sample_after && sample_after_size) sample_after[0] = 0;
     if (len < 88 || memcmp(buf, "MTLB", 4) != 0 || rd16(buf + 6) != 2) return -1;
     if (rd64(buf + 16) > len) return -1;
-    int changed = 0, triples = 0;
+    int changed = 0, triples = 0, triple_status = 0;
     if (rd16(buf + 4) & 0x8000) wr16(buf + 4, rd16(buf + 4) & 0x7fff), changed++;
     if (rd16(buf + 8) > 7) wr16(buf + 8, 7), changed++;
     if (buf[11] == 0x81) buf[11] = 0x82, changed++;
@@ -96,14 +489,16 @@ int hv_metallib_relabel(uint8_t *buf, size_t len, int stage, int *triple_changes
         if (stage >= 2 && hash && bc_off != ~0ull && bc_off <= bcs && mdsz <= bcs - bc_off) {
             uint8_t *code = buf + bc + bc_off;
             int c = relabel_triple(code, (size_t)mdsz, sample_before, sample_before_size, sample_after, sample_after_size);
-            if (c) {
+            if (c > 0) {
                 CC_SHA256(code, (CC_LONG)mdsz, hash);
                 changed += c;
                 triples += c;
+            } else if (c < 0 && !triple_status) {
+                triple_status = c; /* -1: no LLVM bitcode magic; -2: unsupported or malformed bitstream */
             }
         }
         f += size;
     }
-    if (triple_changes) *triple_changes = triples;
+    if (triple_changes) *triple_changes = triples ? triples : triple_status;
     return changed;
 }
