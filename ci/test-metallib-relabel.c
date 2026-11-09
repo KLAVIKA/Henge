@@ -66,9 +66,9 @@ int main(int argc, char **argv) {
     int fields = hv_metallib_relabel(lib, total, 2, &triple_changes,
                                      before, sizeof(before), after, sizeof(after));
     const char *expected_before = "air64_v27-apple-macosx15.0.0";
-    const char *expected_after = "air64_v26-apple-ios17.000.000";
+    const char *expected_after = "air64_v26-apple-ios17.000.00";
     if (fields < 0 || triple_changes != 1 ||
-        strcmp(before, expected_before) || strcmp(after, expected_after)) {
+        strlen(before) != strlen(after) || strcmp(before, expected_before) || strcmp(after, expected_after)) {
         fprintf(stderr, "FAIL fields=%d triple_changes=%d before=[%s] after=[%s]\n",
                 fields, triple_changes, before, after);
         free(lib);
