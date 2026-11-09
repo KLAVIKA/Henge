@@ -5,6 +5,7 @@ import Foundation
 /// Applied at launch and again before each Mac starts, so changes need no relaunch.
 enum EngineTuning {
     static let refreshKey = "henge.perf.hz"
+    static let kickIntervalKey = "henge.perf.kickInterval"
     static let superblocksKey = "henge.perf.superblocks"
     static let wfiSpinKey = "henge.perf.wfiSpin"
     static let fastFlushKey = "henge.perf.fastFlush"
@@ -13,6 +14,7 @@ enum EngineTuning {
         // 60, not 120: every frame macOS draws is emulated and replayed, so 120 Hz
         // halves the CPU left for apps for animation few will notice.
         "HV_HZ": "60",         // the refresh rate macOS is told its display has
+        "HV_KICK_US": "1000",   // how often all guest CPUs are kicked to check timers and devices
         "HV_WFI_SPIN": "0",    // microseconds an idle CPU watches for work before sleeping
         "HV_FLUSH": "2",       // disk flush: F_BARRIERFSYNC, ordered but without a full fsync
         "HV_STATS": "10",      // seconds between engine stats lines in the log; 0 = off
@@ -22,6 +24,8 @@ enum EngineTuning {
         var env = defaults
         let d = UserDefaults.standard
         if [30, 120].contains(d.integer(forKey: refreshKey)) { env["HV_HZ"] = String(d.integer(forKey: refreshKey)) }
+        let kickInterval = d.integer(forKey: kickIntervalKey)
+        if [1, 2, 4].contains(kickInterval) { env["HV_KICK_US"] = String(kickInterval * 1000) }
         if d.bool(forKey: superblocksKey) { env["HV_SUPERBLOCKS"] = "1" } else { unsetenv("HV_SUPERBLOCKS") }
         if d.bool(forKey: wfiSpinKey) { env["HV_WFI_SPIN"] = "50" }
         if d.object(forKey: fastFlushKey) as? Bool == false { env["HV_FLUSH"] = "0" }
