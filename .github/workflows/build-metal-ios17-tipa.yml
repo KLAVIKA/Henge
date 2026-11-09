@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - work/metal-ios17-relabel
+      - work/metal-ios17-perf-port
 
 permissions:
   contents: read
