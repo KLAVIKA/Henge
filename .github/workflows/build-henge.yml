@@ -72,7 +72,22 @@ jobs:
       # fetched by fetch_sources.sh, which Husk's own ci_build.sh runs first.
       - name: Fetch Husk's third-party sources
         working-directory: Husk
-        run: bash scripts/fetch_sources.sh
+        run: |
+          set -euo pipefail
+          # The fetch script skips archives already downloaded and unpacked,
+          # so retrying the pass resumes after transient GitHub 5xx responses.
+          for attempt in 1 2 3 4 5; do
+            if bash scripts/fetch_sources.sh; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 5 ]; then
+              echo "Husk source downloads failed after $attempt attempts" >&2
+              exit 1
+            fi
+            delay=$((attempt * 15))
+            echo "Husk source download attempt $attempt failed; retrying in ${delay}s" >&2
+            sleep "$delay"
+          done
 
       # Henge only needs these three sysroot pieces: libffi (a glib dep),
       # glib (whose meson subprojects also produce libpcre2-8 and libintl),

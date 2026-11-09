@@ -29,7 +29,20 @@ git clone --depth 1 https://github.com/Leviidev/Husk.git "$HUSK_ROOT"
 git -C "$HUSK_ROOT" fetch --depth 1 origin "$HUSK_REV"
 git -C "$HUSK_ROOT" checkout --detach "$HUSK_REV"
 cd "$HUSK_ROOT"
-./scripts/fetch_sources.sh
+# fetch_sources.sh is resumable: successful archives and unpack markers are kept.
+# Retry the whole pass so transient GitHub 5xx responses only re-fetch missing files.
+for attempt in 1 2 3 4 5; do
+    if ./scripts/fetch_sources.sh; then
+        break
+    fi
+    if (( attempt == 5 )); then
+        echo "Husk source downloads failed after $attempt attempts" >&2
+        exit 1
+    fi
+    delay=$((attempt * 15))
+    echo "Husk source download attempt $attempt failed; retrying in ${delay}s" >&2
+    sleep "$delay"
+done
 ./scripts/build_ios.sh libffi glib libslirp
 ./scripts/build_rppairing_ios.sh
 
