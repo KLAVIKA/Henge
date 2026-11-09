@@ -110,6 +110,15 @@ jobs:
         working-directory: Henge
         run: zsh tools/build_ios_restore.sh
 
+      - name: Run JIT, memory, and MMU regression tests
+        working-directory: Henge
+        run: |
+          set -euo pipefail
+          make build/test_mem build/test_mmu
+          ulimit -s 65520
+          ./build/test_mem
+          ./build/test_mmu
+
       - name: Build the engine
         working-directory: Henge
         run: make ios-lib
@@ -127,3 +136,18 @@ jobs:
           name: Henge-ipa-${{ github.sha }}
           path: /Users/runner/Desktop/Henge.ipa
           if-no-files-found: error
+
+      - name: Package TrollStore TIPA
+        working-directory: Henge
+        run: |
+          set -euo pipefail
+          zsh ios/scripts/package_ipa.sh --trollstore
+          test -s "$HOME/Desktop/Henge.tipa"
+
+      - name: Upload Henge.tipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: Henge-iOS17-Metal-Perf-TIPA-${{ github.sha }}
+          path: /Users/runner/Desktop/Henge.tipa
+          if-no-files-found: error
+          retention-days: 14
