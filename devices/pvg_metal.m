@@ -886,8 +886,12 @@ static void note_plane_hashes(HvObject *s) {
         s->plane_hash[i] = hash_bytes(s->mapped + s->first + s->plane_from[i], plane_bytes(s, i));
 }
 
+/* Per-exec IOSurface sync timings; seconds are accumulated by the caller. */
+typedef struct { double hash, lock, copy; } HvSyncTiming;
+
 /* Guest pixels into its IOSurface, when they changed. */
-static void sync_iosurface(HvObject *s) {
+static void sync_iosurface(HvObject *s, HvSyncTiming *timing) {
+    double phase = now_seconds();
     if (!s->iosurface) return;
     const uint8_t *from = s->mapped + s->first;
     BOOL by_plane = s->plane_count && IOSurfaceGetPlaneCount(s->iosurface) >= s->plane_count;
@@ -898,13 +902,23 @@ static void sync_iosurface(HvObject *s) {
             hashes[i] = hash_bytes(from + s->plane_from[i], plane_bytes(s, i));
             if (hashes[i] != s->plane_hash[i]) changed |= 1u << i;
         }
-        if (!changed) return;
+            if (!changed) {
+            if (timing) timing->hash += now_seconds() - phase;
+            return;
+        }
     } else {
         uint64_t hash = guest_hash(s);
-        if (hash == s->content_hash) return;
+        if (hash == s->content_hash) {
+            if (timing) timing->hash += now_seconds() - phase;
+            return;
+        }
         s->content_hash = hash;
     }
+    if (timing) timing->hash += now_seconds() - phase;
+    phase = now_seconds();
     IOSurfaceLock(s->iosurface, 0, NULL);
+    if (timing) timing->lock += now_seconds() - phase;
+    phase = now_seconds();
     /* HV_PVG_HOST_DUMP=prefix (debugging): the host surface as it is just before the guest's pixels go over it,
        for the first few multi-plane surfaces, with its layout in a .txt beside it: did the GPU draw something here
        that this copy throws away? */
@@ -948,6 +962,7 @@ static void sync_iosurface(HvObject *s) {
         memcpy(base, from, MIN(s->alloc, IOSurfaceGetAllocSize(s->iosurface)));
     }
     IOSurfaceUnlock(s->iosurface, 0, NULL);
+    if (timing) timing->copy += now_seconds() - phase;
     const char *dump = getenv("HV_PVG_SURFACE_DUMP");
     static int dumped;
     if (dump && s->plane_count && dumped < 6) {
@@ -1077,7 +1092,7 @@ static void sync_iosurface(HvObject *s) {
                     for (int i = 0; i < 96; i++) [m appendFormat:@" %08x", ((const uint32_t *)desc)[i]];
                     [self complain:m];
                 }
-                sync_iosurface(surface);
+                sync_iosurface(surface, NULL);
             }
         }
         fprintf(stderr, "hengevm: pvg-metal: surface %llu: %lux%lu format %lu, row %llu, %llu KB, fourcc %c%c%c%c planes %u\n", h.mapping, (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.pixelFormat, row, alloc >> 10, desc[7], desc[6], desc[5], desc[4], desc[0x3e]);
@@ -2075,7 +2090,7 @@ typedef struct {
 }
 
 /* Returns YES if the GPU's completion gives the stamp back. */
-- (BOOL)exec:(const uint32_t *)a length:(uint32_t)len channel:(uint32_t)ch stamp:(uint32_t)stamp {
+- (BOOL)exec:(const uint32_t *)a length:(uint32_t)len channel:(uint32_t)ch stamp:(uint32_t)stamp sequence:(uint64_t)sequence workerQueueMs:(double)workerQueueMs {
     uint32_t task = a[0], nres = a[1], nbuf = a[2];
     if (12 + nres * 8ull + nbuf * 16ull > len) { /* never quietly: a lost job is a frame that never gets drawn */
         [self complain:[NSString stringWithFormat:@"exec of %u bytes dropped: task %u, %u resources, %u buffers", len, task, nres, nbuf]];
@@ -2090,14 +2105,37 @@ typedef struct {
     if (tracing) fprintf(stderr, "trace: exec task %u, %u resources, %u buffers\n", task, nres, nbuf);
     uint64_t execID = execs + 1, drawsBefore = draws, payloadBytes = 0;
     double t_begin = now_seconds();
+    double refresh_ms = 0, refresh_max_ms = 0;
+    uint32_t refresh_count = 0, refresh_max_ref = 0;
+    double sync_ms = 0, sync_hash_ms = 0, sync_lock_ms = 0, sync_copy_ms = 0, sync_max_ms = 0;
+    uint32_t sync_count = 0, sync_max_ref = 0;
+    double buffer_alloc_ms = 0, buffer_read_ms = 0, command_parse_ms = 0, encoder_call_ms = 0;
     id<MTLCommandBuffer> cb = [queue commandBuffer];
     id<MTLBlitCommandEncoder> blit = nil;
     BOOL sync_after = NO;
     for (uint32_t i = 0; i < nres; i++) {
         HvObject *o = [self object:res[i * 2] task:task];
         if (!o) continue;
-        if (o->mapped) refresh_pages(self, task, o);
-        if (o->surface) sync_iosurface(o->surface);
+        if (o->mapped) {
+            double phase = now_seconds();
+            refresh_pages(self, task, o);
+            double elapsed = now_seconds() - phase;
+            refresh_ms += elapsed;
+            refresh_count++;
+            if (elapsed > refresh_max_ms) refresh_max_ms = elapsed, refresh_max_ref = res[i * 2];
+        }
+        if (o->surface) {
+            HvSyncTiming st = {0};
+            double phase = now_seconds();
+            sync_iosurface(o->surface, &st);
+            double elapsed = now_seconds() - phase;
+            sync_ms += elapsed;
+            sync_hash_ms += st.hash;
+            sync_lock_ms += st.lock;
+            sync_copy_ms += st.copy;
+            sync_count++;
+            if (elapsed > sync_max_ms) sync_max_ms = elapsed, sync_max_ref = res[i * 2];
+        }
         if (getenv("HV_PVG_TALLY") && (o->entry[0] & 0xff) == OBJ_MAPPED_TEXTURE) {
             static uint32_t seen[256];
             uint32_t f = res[i * 2 + 1] & 0xff, key = res[i * 2] & 0xff;
@@ -2128,8 +2166,13 @@ typedef struct {
         memcpy(&blen, bufs + b * 16 + 8, 8);
         if (UINT64_MAX - payloadBytes >= blen) payloadBytes += blen; else payloadBytes = UINT64_MAX;
         if (blen > (64u << 20) || blen < 8) continue;
+        double phase = now_seconds();
         NSMutableData *copy = [NSMutableData dataWithLength:(NSUInteger)blen];
+        buffer_alloc_ms += (now_seconds() - phase) * 1000.0;
+        phase = now_seconds();
         if (hv_pvg_lite_task_read(lite, task, off, copy.mutableBytes, (uint32_t)blen)) { [self complain:@"command buffer unreadable"]; continue; }
+        buffer_read_ms += (now_seconds() - phase) * 1000.0;
+        double parse_start = now_seconds(), encoder_seconds = 0;
         const uint8_t *p = copy.bytes, *end = p + blen;
         uint32_t seglen, info;
         memcpy(&seglen, p, 4), memcpy(&info, p + 4, 4);
@@ -2153,6 +2196,7 @@ typedef struct {
                 else [self complain:[NSString stringWithFormat:@"encoder type %u command %u (%u bytes) skipped", type, tag, sz]];
                 q += sz;
             }
+            command_parse_ms += (now_seconds() - parse_start) * 1000.0;
             continue;
         }
         if (!e && type == 1) e = [cb computeCommandEncoder], pipeline_set = NO;
@@ -2175,9 +2219,11 @@ typedef struct {
                     e = [self beginPass:r task:task commandBuffer:cb];
                     pipeline_set = NO, tess_factors = NO;
                 } else if (e) {
+                    double encoder_start = now_seconds();
                     if (etype == 0) [self render:e tag:tag rec:r task:task];
                     else if (etype == 1) [self compute:e tag:tag rec:r task:task];
                     else [self blit:e tag:tag rec:r task:task];
+                    encoder_seconds += now_seconds() - encoder_start;
                 }
                 p += size;
             }
@@ -2185,6 +2231,8 @@ typedef struct {
             [self complain:[NSString stringWithFormat:@"exception: %@", x.reason]];
             failed++;
         }
+        command_parse_ms += (now_seconds() - parse_start) * 1000.0;
+        encoder_call_ms += encoder_seconds * 1000.0;
         if (!more && e) { [e endEncoding]; e = nil; }
     }
     if (e) [e endEncoding];
@@ -2208,9 +2256,13 @@ typedef struct {
     else if (exec_encode > 0.100) exec_over_100ms++;
     else if (exec_encode > 0.050) exec_over_50ms++;
     if (exec_encode >= 0.016) {
-        fprintf(stderr, "hengevm: pvg-metal: slow-exec task %u exec %llu ch %u stamp 0x%x encode %.2f ms bytes %u resources %u buffers %u payload %llu bytes draws %llu\n",
-                task, (unsigned long long)execID, ch, stamp, exec_encode_ms, len, nres, nbuf,
-                (unsigned long long)payloadBytes, (unsigned long long)drawCount);
+        fprintf(stderr, "hengevm: pvg-metal: slow-exec task %u exec %llu seq %llu ch %u stamp 0x%x encode %.2f ms workerQ %.2f ms bytes %u resources %u buffers %u payload %llu bytes draws %llu; refresh %u total %.2f max %.2f ref %u; IOSurface %u total %.2f max %.2f ref %u hash %.2f lock %.2f copy %.2f; buffer alloc %.2f read %.2f; command parse+encode %.2f encoder-calls %.2f ms\n",
+                task, (unsigned long long)execID, (unsigned long long)sequence, ch, stamp, exec_encode_ms, workerQueueMs, len, nres, nbuf,
+                (unsigned long long)payloadBytes, (unsigned long long)drawCount,
+                refresh_count, refresh_ms * 1000.0, refresh_max_ms * 1000.0, refresh_max_ref,
+                sync_count, sync_ms * 1000.0, sync_max_ms * 1000.0, sync_max_ref,
+                sync_hash_ms * 1000.0, sync_lock_ms * 1000.0, sync_copy_ms * 1000.0,
+                buffer_alloc_ms, buffer_read_ms, command_parse_ms, encoder_call_ms);
     }
     [self commit:cb channel:ch stamp:stamp complete:YES task:task execID:execID resources:nres buffers:nbuf
       payloadBytes:payloadBytes draws:drawCount encodeMs:exec_encode_ms];
@@ -2886,7 +2938,7 @@ void hv_pvg_metal_submit(HvPvgMetal *m, HvPvgLite *lite, uint32_t ch, uint64_t s
                         fprintf(stderr, "hengevm: pvg-metal: exec seq %llu op %#x channel %u task %u resources %u buffers %u refs [%s]\n",
                                 (unsigned long long)sequence, op, ch, task, nres, nbuf, refs.UTF8String);
                     }
-                    gpu_completes = [r exec:args length:n channel:ch stamp:cmd[2]];
+                    gpu_completes = [r exec:args length:n channel:ch stamp:cmd[2] sequence:sequence workerQueueMs:queue_delay * 1000.0];
                 } else if ((op == 0x25 || op == 0x28) && n >= 8) { /* {task, ref} or {task, tag, size, ref} */
                     static unsigned destroy_logs;
                     uint32_t ref = op == 0x25 ? args[1] : (n >= 16 ? args[3] : 0);
