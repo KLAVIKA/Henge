@@ -631,16 +631,22 @@ static void do_channel(HvPvgLite *p, uint32_t ch) {
 
 /* The mapper's ring: surfaces coming and going. The guest waits for its interrupt. */
 static void do_mapper(HvPvgLite *p) {
+    static unsigned summary_logs, event_logs;
+    uint64_t ring = p->io_regs[0], table = p->io_regs[0x10 / 8];
+    uint64_t size = p->io_regs[0x8 / 8], want = p->io_regs[0x18 / 8], read = p->io_regs[0x20 / 8];
+    if (summary_logs++ < 24)
+        fprintf(stderr, "hengevm: pvg-lite: mapper doorbell read %llu want %llu ring %#llx size %llu table %#llx\n",
+                (unsigned long long)read, (unsigned long long)want, (unsigned long long)ring,
+                (unsigned long long)size, (unsigned long long)table);
     if (p->tally) {
-        uint64_t ring = p->io_regs[0], table = p->io_regs[0x10 / 8], size = p->io_regs[0x8 / 8], want = p->io_regs[0x18 / 8];
-        for (uint64_t i = p->io_regs[0x20 / 8]; i < want && size; i++) {
+        for (uint64_t i = read; i < want && size; i++) {
             uint32_t *e = hv_phys_ptr(p->m, ring + (i % size) * 16, 16);
             uint32_t *t = table ? hv_phys_ptr(p->m, table, 64) : NULL;
             if (!e || !t) continue;
             fprintf(stderr, "pvgmap op %u id %u table %x %x %x %x\n", e[0], e[1], t[0], t[1], t[2], t[3]);
             uint32_t seg = e[1] / 16, idx = e[1] % 16;
             uint32_t *ta = hv_phys_ptr(p->m, table + seg * 4, 4);
-            uint32_t *d = ta ? hv_phys_ptr(p->m, ((uint64_t)(*ta & ~1u) << 12) + idx * 0x400ull, 0x400) : NULL;
+            uint32_t *d = ta && (*ta & 1) ? hv_phys_ptr(p->m, ((uint64_t)(*ta & ~1u) << 12) + idx * 0x400ull, 0x400) : NULL;
             if (d && e[0] == 1) {
                 fprintf(stderr, "pvgdesc");
                 for (int k = 0; k < 64; k++) fprintf(stderr, " %08x", d[k]);
@@ -649,10 +655,32 @@ static void do_mapper(HvPvgLite *p) {
         }
     }
     if (p->metal) {
-        uint64_t ring = p->io_regs[0], size = p->io_regs[0x8 / 8], want = p->io_regs[0x18 / 8];
-        for (uint64_t i = p->io_regs[0x20 / 8]; i < want && size; i++) {
+        for (uint64_t i = read; i < want && size; i++) {
             uint32_t *e = hv_phys_ptr(p->m, ring + (i % size) * 16, 16);
-            if (e && e[0] == 2) hv_pvg_metal_unmap(p->metal, e[1]);
+            if (!e) continue;
+            if (event_logs++ < 64) {
+                uint32_t seg = e[1] / 16, idx = e[1] % 16;
+                uint32_t *ta = table ? hv_phys_ptr(p->m, table + seg * 4, 4) : NULL;
+                uint32_t entry = ta ? *ta : 0;
+                uint32_t *d = ta && (entry & 1)
+                    ? hv_phys_ptr(p->m, ((uint64_t)(entry & ~1u) << 12) + idx * 0x400ull, 0x400) : NULL;
+                fprintf(stderr, "hengevm: pvg-lite: mapper event op %u id %u table-entry %#x descriptor %s\n",
+                        e[0], e[1], entry, d ? "present" : "missing");
+                if (d && e[0] == 1) {
+                    uint32_t fourcc, first;
+                    uint64_t alloc, width, height, row;
+                    memcpy(&fourcc, d + 4, 4);
+                    memcpy(&alloc, d + 0x18, 8);
+                    memcpy(&width, d + 0x20, 8);
+                    memcpy(&height, d + 0x28, 8);
+                    memcpy(&row, d + 0x30, 8);
+                    memcpy(&first, d + 0x60, 4);
+                    fprintf(stderr, "hengevm: pvg-lite: map descriptor id %u fourcc %#x size %llux%llu row %llu alloc %llu first %u planes %u\n",
+                            e[1], fourcc, (unsigned long long)width, (unsigned long long)height,
+                            (unsigned long long)row, (unsigned long long)alloc, first, d[0x3e]);
+                }
+            }
+            if (e[0] == 2) hv_pvg_metal_unmap(p->metal, e[1]);
         }
     }
     p->io_regs[0x20 / 8] = p->io_regs[0x18 / 8];
