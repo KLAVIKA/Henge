@@ -376,6 +376,44 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
 }
 @end
 
+/* Preserve rejected libraries on-device if every iOS 17 relabel stage still fails. */
+static _Atomic unsigned hv_failed_library_dump_count = 0;
+
+static void hv_dump_failed_library(NSData *lib, uint32_t task, uint64_t function_ref_address,
+                                   uint64_t guest_library_offset, NSError *metal_error) {
+    const unsigned index = atomic_fetch_add_explicit(&hv_failed_library_dump_count, 1, memory_order_relaxed);
+    if (index >= 64) return;
+    if (!lib.length || lib.length > 128ull * 1024 * 1024) return;
+
+    NSString *directory = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/HengeMetalFailedLibraries"];
+    NSError *directory_error = nil;
+    if (![[NSFileManager defaultManager] createDirectoryAtPath:directory
+                                    withIntermediateDirectories:YES attributes:nil error:&directory_error]) {
+        fprintf(stderr, "hengevm: pvg-metal: cannot create failed-library dump directory: %s\\n",
+                directory_error.localizedDescription.UTF8String ?: "unknown");
+        return;
+    }
+
+    NSString *base = [NSString stringWithFormat:@"failed-%02u-task-%u-ref-%llx-off-%llx",
+                      index + 1, task, (unsigned long long)function_ref_address,
+                      (unsigned long long)guest_library_offset];
+    NSString *binary = [directory stringByAppendingPathComponent:[base stringByAppendingString:@".metallib"]];
+    NSError *write_error = nil;
+    if (![lib writeToFile:binary options:NSDataWritingAtomic error:&write_error]) {
+        fprintf(stderr, "hengevm: pvg-metal: failed-library dump write failed: %s\\n",
+                write_error.localizedDescription.UTF8String ?: "unknown");
+        return;
+    }
+    NSString *metadata = [NSString stringWithFormat:
+        @"task=%u\\nfunction_ref_address=0x%llx\\nguest_library_offset=0x%llx\\nlength=%lu\\nmetal_error=%@\\n",
+        task, (unsigned long long)function_ref_address, (unsigned long long)guest_library_offset,
+        (unsigned long)lib.length, metal_error.localizedDescription ?: @"unknown"];
+    [metadata writeToFile:[directory stringByAppendingPathComponent:[base stringByAppendingString:@".txt"]]
+                atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    fprintf(stderr, "hengevm: pvg-metal: saved rejected metallib %s (%lu bytes)\\n",
+            binary.lastPathComponent.UTF8String, (unsigned long)lib.length);
+}
+
 @implementation HvReplay
 
 - (void)complain:(NSString *)what {
@@ -438,7 +476,9 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
         }
     }
     if (!library) {
-        [self complain:[NSString stringWithFormat:@"library: %@", (first_err ?: err).localizedDescription]];
+        NSError *failure = first_err ?: err;
+        hv_dump_failed_library(lib, task, at, h.off, failure);
+        [self complain:[NSString stringWithFormat:@"library: %@", failure.localizedDescription]];
         return nil;
     }
     {   /* m4 fork: while tracing, keep each library macOS sends, to read its shaders on a Mac */
