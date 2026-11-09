@@ -44,6 +44,7 @@ static int cursor_scale(void) {
 
 #include "pvg_lite.h"
 #include "metallib.h"
+#include "../host/vm.h"
 
 #if !TARGET_OS_IPHONE
 #import <CoreGraphics/CoreGraphics.h>
@@ -2255,6 +2256,7 @@ typedef struct {
                 (unsigned long long)atomic_load(&gpu_frames));
         fprintf(stderr, "hengevm: pvg-inflight: current %d max %d\n",
                 atomic_load(&inflight), max_inflight_count);
+        hv_vm_input_latency_dump();
         encode_time = gpu_wait_time = 0;
     }
     return YES;
@@ -2823,6 +2825,8 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
 }
 
 void hv_pvg_metal_submit(HvPvgMetal *m, HvPvgLite *lite, uint32_t ch, uint64_t sequence, uint32_t *cmd, uint32_t len) {
+    /* A PVG display swap is the guest's first observable GUI redraw response. */
+    if ((cmd[0] & 0xffff) == 8) hv_vm_note_ui_response();
     HvReplay *r = (__bridge HvReplay *)m;
     double queued_at = now_seconds();
     int queued = atomic_fetch_add(&r->queued_work, 1) + 1;
