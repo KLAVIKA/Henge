@@ -331,8 +331,19 @@ int hv_vm_create(const HvVmConfig *c, char *err, size_t errlen) {
 
 static void *kicker_thread(void *unused) {
     (void)unused;
+    unsigned interval_us = 1000;
+    const char *setting = getenv("HV_KICK_US");
+    if (setting && *setting) {
+        char *end = NULL;
+        unsigned long value = strtoul(setting, &end, 10);
+        if (end != setting && *end == '\0' && value >= 500 && value <= 10000)
+            interval_us = (unsigned)value;
+        else
+            fprintf(stderr, "hengevm: invalid HV_KICK_US=%s; using 1000\n", setting);
+    }
+    fprintf(stderr, "hengevm: guest CPU kick interval %u us\n", interval_us);
     for (;;) {
-        usleep(1000);
+        usleep(interval_us);
         hv_machine_kick_all(&m);
     }
     return NULL;
