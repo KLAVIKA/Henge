@@ -888,6 +888,15 @@ static void sync_iosurface(HvObject *s) {
    (physical >> 12, bit 0 present, one per 16 KB), first-page offset +0x60,
    allocation +0x18, bytes per row +0x30. */
 - (void)makeMappedTexture:(HvObject *)o at:(uint64_t)at task:(uint32_t)task {
+    static unsigned calls;
+    struct __attribute__((packed)) { uint64_t mapping; uint32_t tag, size, ref; uint8_t d[64]; } probe;
+    memset(&probe, 0, sizeof probe);
+    const uint32_t probe_head = (uint32_t)offsetof(__typeof__(probe), d);
+    int probe_read = hv_pvg_lite_task_read(lite, task, at, &probe, probe_head + 32);
+    if (calls++ < 64)
+        fprintf(stderr, "hengevm: pvg-metal: mapped-texture request task %u at %#llx read %d mapping %llu tag %#x size %#x ref %u\n",
+                task, (unsigned long long)at, probe_read, (unsigned long long)probe.mapping,
+                probe.tag, probe.size, probe.ref);
     /* d holds a v2 description (tag 0x39, 0x38 bytes) whose swizzle sits at +0x23..0x26: with only 32 bytes
        read those came from the stack, and macOS 27.2's first surface made Metal abort Henge (swizzle 193). */
     struct __attribute__((packed)) { uint64_t mapping; uint32_t tag, size, ref; uint8_t d[64]; } h;
@@ -903,7 +912,12 @@ static void sync_iosurface(HvObject *s) {
     MTLTextureDescriptor *t = h.tag == 0x39 ? descriptor_v2(h.d) : descriptor_v1(h.d);
     if (!surface) {
         const uint8_t *desc = hv_pvg_lite_surface(lite, (uint32_t)h.mapping);
-        if (!desc) { [self complain:[NSString stringWithFormat:@"surface %llu has no descriptor", h.mapping]]; return; }
+        if (!desc) {
+            static unsigned missing;
+            if (missing++ < 32) fprintf(stderr, "hengevm: pvg-metal: surface %llu descriptor lookup failed (task %u)\n", (unsigned long long)h.mapping, task);
+            [self complain:[NSString stringWithFormat:@"surface %llu has no descriptor", h.mapping]];
+            return;
+        }
         uint32_t list, first;
         uint64_t alloc, row;
         memcpy(&list, desc, 4), memcpy(&alloc, desc + 0x18, 8), memcpy(&row, desc + 0x30, 8), memcpy(&first, desc + 0x60, 4);
@@ -934,6 +948,10 @@ static void sync_iosurface(HvObject *s) {
                                                deallocator:^(void *at, NSUInteger size) { vm_deallocate(mach_task_self(), (vm_address_t)at, size); }];
         surface->mapping_in_buffer = surface->object != nil;
         surfaces[key] = surface;
+        static unsigned registered;
+        if (registered++ < 64)
+            fprintf(stderr, "hengevm: pvg-metal: surface registered mapping %llu task %u dimensions %ux%u total %lu\n",
+                    (unsigned long long)h.mapping, task, surface->surface_w, surface->surface_h, (unsigned long)surfaces.count);
         if (desc[0x3e] >= 2) {
             surface->alloc = alloc;
             IOSurfaceRef made = make_iosurface(surface, desc, alloc);
@@ -1049,7 +1067,11 @@ static void sync_iosurface(HvObject *s) {
         [self makeBuffer:o at:at task:task];
         break;
     case 0: break; /* an empty slot */
-    case OBJ_MAPPED_TEXTURE: [self makeMappedTexture:o at:at task:task]; break;
+    case OBJ_MAPPED_TEXTURE:
+        if (getenv("HV_PVG_OBJECT_LOG")) fprintf(stderr, "hengevm: pvg-metal: object type mapped-texture task %u ref %u entry-size %u at %#llx\n",
+                                                   task, ref, size, (unsigned long long)at);
+        [self makeMappedTexture:o at:at task:task];
+        break;
     default: {
         uint32_t w[24] = {0};
         hv_pvg_lite_task_read(lite, task, at, w, sizeof w);
@@ -2224,7 +2246,17 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
 
 - (void)showOnLayer:(uint64_t)mapping {
     HvObject *surface = surfaces[@(mapping)];
-    if (!surface) { [self complain:[NSString stringWithFormat:@"swap to unknown surface %llu", mapping]]; return; }
+    if (!surface) {
+        static unsigned unknown;
+        if (unknown++ < 32) {
+            NSMutableString *keys = [NSMutableString new];
+            for (NSNumber *key in surfaces) [keys appendFormat:@"%@,", key];
+            fprintf(stderr, "hengevm: pvg-metal: display lookup missing mapping %llu; registered count %lu keys [%s]\n",
+                    (unsigned long long)mapping, (unsigned long)surfaces.count, keys.UTF8String);
+        }
+        [self complain:[NSString stringWithFormat:@"swap to unknown surface %llu", mapping]];
+        return;
+    }
     on_screen = mapping;
     BOOL half = surface->fourcc == 'RGhA';
     if (!screen_tex) fprintf(stderr, "hengevm: display scanout format %s (%ux%u)\n",
@@ -2535,6 +2567,16 @@ void hv_pvg_metal_submit(HvPvgMetal *m, HvPvgLite *lite, uint32_t ch, uint32_t *
             BOOL gpu_completes = NO;
             @try {
                 if ((op == 0x43 || op == 0x45) && n >= 12) {
+                    static unsigned exec_logs;
+                    if (exec_logs++ < 64) {
+                        uint32_t task = args[0], nres = args[1], nbuf = args[2];
+                        NSMutableString *refs = [NSMutableString new];
+                        const uint32_t *res = args + 3;
+                        for (uint32_t i = 0; i < MIN(nres, 12u); i++)
+                            [refs appendFormat:@"%@%u", i ? @"," : @"", res[i * 2]];
+                        fprintf(stderr, "hengevm: pvg-metal: exec op %#x channel %u task %u resources %u buffers %u refs [%s]\n",
+                                op, ch, task, nres, nbuf, refs.UTF8String);
+                    }
                     gpu_completes = [r exec:args length:n channel:ch stamp:cmd[2]];
                 } else if ((op == 0x25 || op == 0x28) && n >= 8) { /* {task, ref} or {task, tag, size, ref} */
                     uint32_t ref = op == 0x25 ? args[1] : (n >= 16 ? args[3] : 0);
@@ -2551,6 +2593,11 @@ void hv_pvg_metal_submit(HvPvgMetal *m, HvPvgLite *lite, uint32_t ch, uint32_t *
                 } else {
                     hv_pvg_lite_command(lite, cmd, len);
                     if (op == 8 && n >= 16) {
+                        static unsigned swap_logs;
+                        uint64_t mapping = (uint64_t)args[3] << 32 | args[2];
+                        if (swap_logs++ < 32)
+                            fprintf(stderr, "hengevm: pvg-metal: display swap request mapping %llu port %u surfaces %lu\n",
+                                    (unsigned long long)mapping, args[0], (unsigned long)r->surfaces.count);
                         if (r->tracing) fprintf(stderr, "trace: swap to %llu\n", (uint64_t)args[3] << 32 | args[2]);
                         cp_note_swap(r, (uint64_t)args[3] << 32 | args[2], args, n);
                         [r present:(uint64_t)args[3] << 32 | args[2]];
