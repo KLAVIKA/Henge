@@ -136,6 +136,8 @@ enum { OBJ_BUFFER = 1, OBJ_TEXTURE = 2, OBJ_FUNCTION = 6, OBJ_SERIALIZED = 7, OB
     NSMutableDictionary<NSString *, NSNumber *> *planar_uses; /* mappings using each: the entry goes with the last one */
     NSMutableSet<NSString *> *complaints;
     uint64_t execs, draws, failed, heap_bytes, synced, remaps;
+    uint64_t render_pipeline_ok, render_pipeline_failed, tile_pipeline_ok, tile_pipeline_failed;
+    uint64_t compute_pipeline_ok, compute_pipeline_failed, draws_skipped_no_pipeline;
     /* Work the GPU has not finished. Stamps are given back in the order they came: the
        GPU's completion handlers run in the order of commit. */
     _Atomic int inflight;
@@ -463,7 +465,19 @@ static void hv_dump_failed_library(NSData *lib, uint32_t task, uint64_t function
         NSMutableData *try = lib;
         if (stage) {
             try = [lib mutableCopy];
-            if (hv_metallib_relabel(try.mutableBytes, try.length, stage) <= 0) continue;
+            int triple_changes = 0;
+            char triple_before[96] = {0}, triple_after[96] = {0};
+            int fields_changed = hv_metallib_relabel(try.mutableBytes, try.length, stage,
+                                                     &triple_changes, triple_before, sizeof triple_before,
+                                                     triple_after, sizeof triple_after);
+            if (stage == 2) {
+                static unsigned relabel_diagnostics;
+                if (relabel_diagnostics++ < 64)
+                    fprintf(stderr, "hengevm: pvg-metal: relabel-detail task %u library-at %#llx bytes %u stage %d fields %d triple-rewrites %d before [%s] after [%s]\n",
+                            task, (unsigned long long)at, h.len, stage, fields_changed, triple_changes,
+                            triple_before[0] ? triple_before : "none", triple_after[0] ? triple_after : "none");
+            }
+            if (fields_changed <= 0) continue;
         }
         dispatch_data_t data = dispatch_data_create(try.bytes, try.length, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
         err = nil;
@@ -514,7 +528,28 @@ static void hv_dump_failed_library(NSData *lib, uint32_t task, uint64_t function
         NSError *err = nil;
         id state = tag == 0xe ? [device newRenderPipelineStateWithDescriptor:descriptor error:&err]
                               : [device newRenderPipelineStateWithTileDescriptor:descriptor options:MTLPipelineOptionNone reflection:nil error:&err];
-        if (!state) [self complain:[NSString stringWithFormat:@"pipeline %u: %@", tag, err.localizedDescription]];
+        if (state) {
+            if (tag == 0xe) render_pipeline_ok++; else tile_pipeline_ok++;
+        } else {
+            if (tag == 0xe) render_pipeline_failed++; else tile_pipeline_failed++;
+            NSString *functions = @"unknown";
+            if (tag == 0xe) {
+                MTLRenderPipelineDescriptor *rp = descriptor;
+                functions = [NSString stringWithFormat:@"vertex=%@ fragment=%@", rp.vertexFunction.name ?: @"?", rp.fragmentFunction.name ?: @"?"];
+            } else {
+                SEL tileSel = sel_registerName("tileFunction");
+                id fn = [descriptor respondsToSelector:tileSel] ? ((id (*)(id, SEL))objc_msgSend)(descriptor, tileSel) : nil;
+                NSString *fnName = [fn respondsToSelector:@selector(name)] ? ((id (*)(id, SEL))objc_msgSend)(fn, @selector(name)) : @"?";
+                functions = [NSString stringWithFormat:@"tile=%@", fnName];
+            }
+            static unsigned pipeline_failure_details;
+            if (pipeline_failure_details++ < 64)
+                fprintf(stderr, "hengevm: pvg-metal: pipeline-error kind=%s tag=%u domain=%s code=%ld functions=[%s] descriptor=%s message=%s\n",
+                        tag == 0xe ? "render" : "tile", tag, err.domain.UTF8String ?: "?", (long)err.code,
+                        functions.UTF8String ?: "?", NSStringFromClass([descriptor class]).UTF8String ?: "?",
+                        err.localizedDescription.UTF8String ?: "?");
+            [self complain:[NSString stringWithFormat:@"pipeline %u: %@", tag, err.localizedDescription]];
+        }
         if (tag == 0xe && getenv("HV_SHADER_DUMP") && atoi(getenv("HV_SHADER_DUMP"))) { /* m4 fork: blend state as this iOS read it */
             MTLRenderPipelineDescriptor *rp = descriptor;
             for (int i = 0; i < 4; i++) {
@@ -546,7 +581,17 @@ static void hv_dump_failed_library(NSData *lib, uint32_t task, uint64_t function
         }
         NSError *err = nil;
         id state = [device newComputePipelineStateWithDescriptor:descriptor options:MTLPipelineOptionNone reflection:nil error:&err];
-        if (!state) [self complain:[NSString stringWithFormat:@"compute pipeline: %@", err.localizedDescription]];
+        if (state) compute_pipeline_ok++;
+        else {
+            compute_pipeline_failed++;
+            MTLComputePipelineDescriptor *cp = descriptor;
+            static unsigned compute_failure_details;
+            if (compute_failure_details++ < 64)
+                fprintf(stderr, "hengevm: pvg-metal: pipeline-error kind=compute tag=11 domain=%s code=%ld function=%s descriptor=%s message=%s\n",
+                        err.domain.UTF8String ?: "?", (long)err.code, cp.computeFunction.name.UTF8String ?: "?",
+                        NSStringFromClass([descriptor class]).UTF8String ?: "?", err.localizedDescription.UTF8String ?: "?");
+            [self complain:[NSString stringWithFormat:@"compute pipeline: %@", err.localizedDescription]];
+        }
         return state;
     }
     if (tag == 3) { /* sampler: {tag, size, ref, bits, lod min, lod max, ...} */
@@ -1327,7 +1372,7 @@ typedef struct {
 
 - (void)render:(id<MTLRenderCommandEncoder>)e tag:(uint32_t)tag rec:(Rec)r task:(uint32_t)task {
     BOOL draw = tag <= 19 || tag == 28 || tag == 29 || tag == 155 || tag == 162;
-    if (!pipeline_set && draw) return;
+    if (!pipeline_set && draw) { draws_skipped_no_pipeline++; return; }
     if (tracing && draw) fprintf(stderr, "trace:  draw tag %u\n", tag);
     switch (tag) {
     case 24: { /* {fence, stages} */
@@ -2105,7 +2150,13 @@ typedef struct {
     if (++execs % 2000 == 0) {
         static double t0;
         if (!t0) t0 = now_seconds();
-        fprintf(stderr, "hengevm: pvg-metal: %llu execs, %llu draws, %llu failed, %llu synced, %llu remaps, %.0f s; encoding %.2f s, waiting for the GPU %.2f s\n", (unsigned long long)execs, (unsigned long long)draws, (unsigned long long)failed, (unsigned long long)synced, (unsigned long long)remaps, now_seconds() - t0, encode_time, gpu_wait_time);
+        fprintf(stderr, "hengevm: pvg-metal: %llu execs, %llu draws, %llu failed, %llu synced, %llu remaps, %.0f s; encoding %.2f s, waiting for the GPU %.2f s; pipeline totals render %llu/%llu tile %llu/%llu compute %llu/%llu; draws skipped-no-pipeline %llu\n",
+                (unsigned long long)execs, (unsigned long long)draws, (unsigned long long)failed,
+                (unsigned long long)synced, (unsigned long long)remaps, now_seconds() - t0,
+                encode_time, gpu_wait_time, (unsigned long long)render_pipeline_ok,
+                (unsigned long long)render_pipeline_failed, (unsigned long long)tile_pipeline_ok,
+                (unsigned long long)tile_pipeline_failed, (unsigned long long)compute_pipeline_ok,
+                (unsigned long long)compute_pipeline_failed, (unsigned long long)draws_skipped_no_pipeline);
         encode_time = gpu_wait_time = 0;
     }
     return YES;
