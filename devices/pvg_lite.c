@@ -60,6 +60,8 @@ struct HvPvgLite {
     uint32_t draining;
     uint32_t barrier_waits[MAX_CHANNELS];
     uint64_t barriers, barrier_drains, barrier_retries, barrier_timeouts;
+    /* Monotonic order of device-side mapper and channel events, assigned under dev_mu. */
+    uint64_t diag_sequence, barrier_block_sequence[MAX_CHANNELS];
     CFTypeRef layer; /* retained until replaced; layer_lock serializes lazy replay handoff */
     os_unfair_lock layer_lock;
     int layer_set; /* an explicit NULL also overrides the renderer's Mac test layer */
@@ -598,6 +600,12 @@ static void do_channel(HvPvgLite *p, uint32_t ch) {
                 if ((int32_t)(p->submitted[b[0]] - b[1]) < 0) {
                     if (++p->barrier_waits[ch] < 20000) { /* not written yet: this channel waits for a later poll */
                         p->barrier_retries++;
+                        if (!p->barrier_block_sequence[ch]) {
+                            p->barrier_block_sequence[ch] = ++p->diag_sequence;
+                            fprintf(stderr, "hengevm: pvg-order: barrier-block seq %llu ch %u rd %#x op %#x stamp %#x waits ch %u stamp %#x submitted %#x\n",
+                                    (unsigned long long)p->barrier_block_sequence[ch], ch, rd, hdr[0] & 0xffff, hdr[2],
+                                    b[0], b[1], p->submitted[b[0]]);
+                        }
                         p->chan_pending |= 1u << ch;
                         blocked = 1;
                         break;
@@ -612,9 +620,24 @@ static void do_channel(HvPvgLite *p, uint32_t ch) {
         channel_command(p, table, size, rd, hdr);
         p->submitted[ch] = hdr[2];
         if (p->metal) {
+            uint64_t blocked_seq = p->barrier_block_sequence[ch];
+            p->barrier_block_sequence[ch] = 0;
+            uint64_t sequence = ++p->diag_sequence;
+            if (blocked_seq)
+                fprintf(stderr, "hengevm: pvg-order: barrier-release seq %llu ch %u rd %#x blocked-seq %llu op %#x stamp %#x\n",
+                        (unsigned long long)sequence, ch, rd, (unsigned long long)blocked_seq, hdr[0] & 0xffff, hdr[2]);
+            static unsigned command_logs;
+            if (command_logs++ < 256)
+                fprintf(stderr, "hengevm: pvg-order: enqueue seq %llu ch %u rd %#x op %#x stamp %#x len %u\n",
+                        (unsigned long long)sequence, ch, rd, hdr[0] & 0xffff, hdr[2], hdr[1]);
             uint32_t *copy = malloc(hdr[1]);
+            if (!copy) {
+                fprintf(stderr, "hengevm: pvg-lite: command copy allocation failed (%u bytes)\n", hdr[1]);
+                rd += hdr[1];
+                continue;
+            }
             ring_read(p, table, size, rd, copy, hdr[1]);
-            hv_pvg_metal_submit(p->metal, p, ch, copy, hdr[1]);
+            hv_pvg_metal_submit(p->metal, p, ch, sequence, copy, hdr[1]);
         } else {
             last = hdr[2], any = 1;
         }
@@ -658,14 +681,15 @@ static void do_mapper(HvPvgLite *p) {
         for (uint64_t i = read; i < want && size; i++) {
             uint32_t *e = hv_phys_ptr(p->m, ring + (i % size) * 16, 16);
             if (!e) continue;
-            if (event_logs++ < 64) {
+            uint64_t sequence = ++p->diag_sequence;
+            if (event_logs++ < 256) {
                 uint32_t seg = e[1] / 16, idx = e[1] % 16;
                 uint32_t *ta = table ? hv_phys_ptr(p->m, table + seg * 4, 4) : NULL;
                 uint32_t entry = ta ? *ta : 0;
                 uint32_t *d = ta && (entry & 1)
                     ? hv_phys_ptr(p->m, ((uint64_t)(entry & ~1u) << 12) + idx * 0x400ull, 0x400) : NULL;
-                fprintf(stderr, "hengevm: pvg-lite: mapper event op %u id %u table-entry %#x descriptor %s\n",
-                        e[0], e[1], entry, d ? "present" : "missing");
+                fprintf(stderr, "hengevm: pvg-order: mapper seq %llu op %u id %u table-entry %#x descriptor %s\n",
+                        (unsigned long long)sequence, e[0], e[1], entry, d ? "present" : "missing");
                 if (d && e[0] == 1) {
                     uint32_t fourcc, first;
                     uint64_t alloc, width, height, row;
@@ -680,7 +704,7 @@ static void do_mapper(HvPvgLite *p) {
                             (unsigned long long)row, (unsigned long long)alloc, first, d[0x3e]);
                 }
             }
-            if (e[0] == 2) hv_pvg_metal_unmap(p->metal, e[1]);
+            if (e[0] == 2) hv_pvg_metal_unmap(p->metal, e[1], sequence);
         }
     }
     p->io_regs[0x20 / 8] = p->io_regs[0x18 / 8];
