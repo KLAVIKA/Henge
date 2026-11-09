@@ -2758,9 +2758,14 @@ void hv_pvg_metal_unmap(HvPvgMetal *m, uint32_t mapping, uint64_t sequence) {
                 NSDictionary *objects = r->tasks[task_key];
                 for (NSNumber *ref_key in objects) {
                     HvObject *item = objects[ref_key];
-                    if (s && item->surface == s) {
+                    BOOL owns_mapping = (s && item->surface == s) ||
+                        (item->mapping_id == mapping &&
+                         (((item->entry[0] & 0xff) == OBJ_MAPPED_TEXTURE) || item->surface));
+                    if (owns_mapping) {
                         refs++;
-                        if (refs <= 12) [owners appendFormat:@"%@:%@,", task_key, ref_key];
+                        if (refs <= 12)
+                            [owners appendFormat:@"%@:%@(type %u,map %llu),", task_key, ref_key,
+                             item->entry[0] & 0xff, (unsigned long long)item->mapping_id];
                     }
                 }
             }
