@@ -1,0 +1,56 @@
+name: Build Henge iOS 17 Metal relabel TIPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - work/metal-ios17-relabel
+
+permissions:
+  contents: read
+
+jobs:
+  build-tipa:
+    name: Build TrollStore package (Xcode 27)
+    runs-on: xcode-27
+    timeout-minutes: 120
+    env:
+      BITRISE_SOURCE_DIR: ${{ github.workspace }}
+      BITRISE_DEPLOY_DIR: ${{ github.workspace }}/artifacts
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Verify toolchain
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcode-select -p
+          mkdir -p "$BITRISE_DEPLOY_DIR" "$HOME/Desktop"
+
+      - name: Build Henge dependencies and IPA
+        run: bash ci/build-bitrise.sh
+
+      - name: Package TrollStore TIPA
+        run: |
+          set -euo pipefail
+          ./ios/scripts/package_ipa.sh --trollstore
+          test -s "$HOME/Desktop/Henge.tipa"
+          cp "$HOME/Desktop/Henge.tipa" "$BITRISE_DEPLOY_DIR/Henge-iOS17-Metal-Relabel.tipa"
+
+      - name: Upload installable package
+        uses: actions/upload-artifact@v4
+        with:
+          name: Henge-iOS17-Metal-Relabel-TIPA
+          path: artifacts/Henge-iOS17-Metal-Relabel.tipa
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Henge-iOS17-Metal-Relabel-Build-Log
+          path: ios/build/DerivedData.buildlog
+          if-no-files-found: warn
+          retention-days: 7
