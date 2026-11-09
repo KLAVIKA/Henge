@@ -927,8 +927,10 @@ static void sync_iosurface(HvObject *s) {
             static unsigned missing;
             if (missing++ < 32) fprintf(stderr, "hengevm: pvg-metal: surface %llu descriptor lookup failed (task %u)\n", (unsigned long long)h.mapping, task);
             [self complain:[NSString stringWithFormat:@"surface %llu has no descriptor", h.mapping]];
-            fprintf(stderr, "hengevm: pvg-metal: mapped-texture failed seq %llu task %u mapping %llu reason descriptor-missing\n",
-                    (unsigned long long)event_sequence, task, (unsigned long long)h.mapping);
+            static unsigned descriptor_failures;
+            if (descriptor_failures++ < 64)
+                fprintf(stderr, "hengevm: pvg-metal: mapped-texture failed seq %llu task %u mapping %llu reason descriptor-missing\n",
+                        (unsigned long long)event_sequence, task, (unsigned long long)h.mapping);
             return;
         }
         uint32_t list, first;
@@ -947,8 +949,10 @@ static void sync_iosurface(HvObject *s) {
         const uint32_t *pages = (list & 1) ? hv_pvg_lite_phys(lite, (uint64_t)(list & ~1u) << 12, n * 4) : NULL;
         if (!pages || vm_allocate(mach_task_self(), &base, surface->length, VM_FLAGS_ANYWHERE) != KERN_SUCCESS) {
             [self complain:[NSString stringWithFormat:@"surface %llu has no pages", h.mapping]];
-            fprintf(stderr, "hengevm: pvg-metal: mapped-texture failed seq %llu task %u mapping %llu reason pages-missing list %#x alloc %llu\n",
-                    (unsigned long long)event_sequence, task, (unsigned long long)h.mapping, list, (unsigned long long)alloc);
+            static unsigned page_failures;
+            if (page_failures++ < 64)
+                fprintf(stderr, "hengevm: pvg-metal: mapped-texture failed seq %llu task %u mapping %llu reason pages-missing list %#x alloc %llu\n",
+                        (unsigned long long)event_sequence, task, (unsigned long long)h.mapping, list, (unsigned long long)alloc);
             return;
         }
         surface->mapped = (uint8_t *)base;
@@ -1067,6 +1071,13 @@ static void sync_iosurface(HvObject *s) {
     HvObject *o = objs[@(ref)];
     uint32_t type = e[0] & 0xff, size = e[0] >> 8;
     uint64_t at = (uint64_t)e[2] << 32 | e[1];
+    if (o && memcmp(o->entry, e, 12)) {
+        static unsigned replaced_logs;
+        if ((o->surface || (o->entry[0] & 0xff) == OBJ_MAPPED_TEXTURE || type == OBJ_MAPPED_TEXTURE) && replaced_logs++ < 128)
+            fprintf(stderr, "hengevm: pvg-metal: object-entry-replaced seq %llu task %u ref %u old-type %u old-mapping %llu new-type %u old-surface %p\n",
+                    (unsigned long long)event_sequence, task, ref, o->entry[0] & 0xff,
+                    (unsigned long long)o->mapping_id, type, (__bridge void *)o->surface);
+    }
     if (o && !memcmp(o->entry, e, 12)) {
         if (type == OBJ_MAPPED_TEXTURE || o->surface) {
             static unsigned cache_hits;
@@ -2616,7 +2627,11 @@ void hv_pvg_metal_submit(HvPvgMetal *m, HvPvgLite *lite, uint32_t ch, uint64_t s
     dispatch_async(r->worker, ^{
         @autoreleasepool {
             r->event_sequence = sequence;
-            uint32_t op = cmd[0] & 0xffff, skip = (cmd[0] >> 16) * 8; /* the barriers come first */
+            uint32_t op = cmd[0] & 0xffff, skip = (cmd[0] >> 16) * 8;
+            static unsigned worker_start_logs;
+            if (worker_start_logs++ < 256)
+                fprintf(stderr, "hengevm: pvg-order: worker-start seq %llu ch %u op %#x stamp %#x\n",
+                        (unsigned long long)sequence, ch, op, cmd[2]); /* the barriers come first */
             const uint32_t *args = (const uint32_t *)((const uint8_t *)cmd + 12 + skip);
             uint32_t n = len > 12 + skip ? len - 12 - skip : 0;
             BOOL gpu_completes = NO;
