@@ -41,6 +41,65 @@ HvVmapple *hv_vm_board(void) { return &board; }
 HvCpu *hv_vm_cpu(int index) { return index >= 0 && index < ncpus ? &cpus[index] : NULL; }
 int hv_vm_ncpus(void) { return ncpus; }
 
+/* Input-to-guest-response latency. This is a correlation metric, not a strict
+   per-event acknowledgement: UI redraws can be coalesced or caused by animation.
+   A response is attributed only to the most recent matching input and only
+   within two seconds, so unrelated later redraws do not contaminate the sample. */
+typedef struct {
+    _Atomic uint64_t pending_ns, count, sum_ns, max_ns;
+    _Atomic uint64_t over_16ms, over_33ms, over_50ms, over_100ms, over_250ms;
+} HvInputLatency;
+
+static HvInputLatency ui_input_latency, pointer_input_latency;
+
+static void input_latency_mark(HvInputLatency *m) {
+    atomic_store_explicit(&m->pending_ns, clock_gettime_nsec_np(CLOCK_MONOTONIC), memory_order_release);
+}
+
+static void input_latency_respond(HvInputLatency *m) {
+    uint64_t started = atomic_exchange_explicit(&m->pending_ns, 0, memory_order_acq_rel);
+    uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+    if (!started || now < started) return;
+    uint64_t elapsed = now - started;
+    if (elapsed > 2000000000ull) return; /* discard stale/unrelated redraws */
+    atomic_fetch_add_explicit(&m->count, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&m->sum_ns, elapsed, memory_order_relaxed);
+    uint64_t old = atomic_load_explicit(&m->max_ns, memory_order_relaxed);
+    while (old < elapsed && !atomic_compare_exchange_weak_explicit(&m->max_ns, &old, elapsed,
+           memory_order_relaxed, memory_order_relaxed)) {}
+    if (elapsed > 16000000ull) atomic_fetch_add(&m->over_16ms, 1);
+    if (elapsed > 33000000ull) atomic_fetch_add(&m->over_33ms, 1);
+    if (elapsed > 50000000ull) atomic_fetch_add(&m->over_50ms, 1);
+    if (elapsed > 100000000ull) atomic_fetch_add(&m->over_100ms, 1);
+    if (elapsed > 250000000ull) atomic_fetch_add(&m->over_250ms, 1);
+}
+
+void hv_vm_note_ui_input(void) { input_latency_mark(&ui_input_latency); }
+void hv_vm_note_pointer_input(void) { input_latency_mark(&pointer_input_latency); }
+void hv_vm_note_ui_response(void) { input_latency_respond(&ui_input_latency); }
+void hv_vm_note_pointer_response(void) { input_latency_respond(&pointer_input_latency); }
+
+static void input_latency_dump_one(const char *label, HvInputLatency *m) {
+    uint64_t n = atomic_exchange(&m->count, 0);
+    uint64_t sum = atomic_exchange(&m->sum_ns, 0);
+    uint64_t max = atomic_exchange(&m->max_ns, 0);
+    uint64_t a16 = atomic_exchange(&m->over_16ms, 0);
+    uint64_t a33 = atomic_exchange(&m->over_33ms, 0);
+    uint64_t a50 = atomic_exchange(&m->over_50ms, 0);
+    uint64_t a100 = atomic_exchange(&m->over_100ms, 0);
+    uint64_t a250 = atomic_exchange(&m->over_250ms, 0);
+    fprintf(stderr, "hengevm: input-latency: %s n %llu avg/max %.2f/%.2f ms >16/33/50/100/250ms %llu/%llu/%llu/%llu/%llu\n",
+            label, (unsigned long long)n, n ? (double)sum / n / 1e6 : 0.0, (double)max / 1e6,
+            (unsigned long long)a16, (unsigned long long)a33, (unsigned long long)a50,
+            (unsigned long long)a100, (unsigned long long)a250);
+}
+
+void hv_vm_input_latency_dump(void) {
+    input_latency_dump_one("ui->pvg-swap", &ui_input_latency);
+    input_latency_dump_one("pointer->cursor", &pointer_input_latency);
+}
+
+
 /* arm64 boot_args: {u16 Revision, u16 Version, u64 virtBase, physBase, memSize,
    topOfKernelData, Video {baseAddr, display, rowBytes, width, height, depth}, ...}.
    Found by scanning page starts for one whose physBase is the RAM base. */
@@ -384,11 +443,13 @@ static void rctrl_hold(int *owner, int down) {
 }
 
 void hv_vm_key(uint16_t code, int down) {
+    hv_vm_note_ui_input();
     if (code == LINUX_KEY_RIGHTCTRL) rctrl_hold(&rctrl_user, down);
     else hv_xhci_key_linux(board.usb, code, down);
 }
 
 void hv_vm_key_hid(uint8_t usage, int down) {
+    hv_vm_note_ui_input();
     if (usage == HID_RIGHT_CONTROL) rctrl_hold(&rctrl_user, down);
     else hv_xhci_key(board.usb, usage, down);
 }
@@ -402,6 +463,7 @@ static void move_now(void *ctx) {
 }
 
 void hv_vm_mouse_move(int dx, int dy) {
+    hv_vm_note_pointer_input();
     int64_t packed = (int64_t)((uint64_t)(uint32_t)dx << 32 | (uint32_t)dy);
     dispatch_async_f(pointer_queue(), (void *)(intptr_t)packed, move_now);
 }
@@ -439,6 +501,7 @@ static void button_now(void *ctx) {
 
 void hv_vm_mouse_button(int button, int down) {
     if (button < 0 || button > 2) return;
+    hv_vm_note_ui_input();
     dispatch_async_f(pointer_queue(), (void *)(intptr_t)(button << 1 | !!down), button_now);
 }
 
@@ -452,8 +515,8 @@ static void wheel(uint16_t axis, int amount) {
     }
 }
 
-void hv_vm_mouse_wheel(int dy) { wheel(HV_REL_WHEEL, dy); }
-void hv_vm_mouse_hwheel(int dx) { wheel(HV_REL_HWHEEL, dx); }
+void hv_vm_mouse_wheel(int dy) { hv_vm_note_ui_input(); wheel(HV_REL_WHEEL, dy); }
+void hv_vm_mouse_hwheel(int dx) { hv_vm_note_ui_input(); wheel(HV_REL_HWHEEL, dx); }
 
 int hv_vm_pointer(int *x, int *y) {
     HvPvgLite *pvg = atomic_load_explicit(&display_pvg, memory_order_acquire);
