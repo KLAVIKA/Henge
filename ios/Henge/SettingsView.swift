@@ -7,6 +7,7 @@ struct SettingsView: View {
     @AppStorage(HardwareMouse.reverseKey) private var reverseScrolling = false
     @AppStorage(HardwareMouse.scrollSpeedKey) private var scrollSpeed = 0.3
     @AppStorage(EngineTuning.refreshKey) private var refreshRate = 60
+    @AppStorage(EngineTuning.kickIntervalKey) private var kickIntervalMs = 1
     @AppStorage(EngineTuning.fastFlushKey) private var fastFlush = true
     @AppStorage(EngineTuning.wfiSpinKey) private var wfiSpin = false
     @AppStorage(EngineTuning.superblocksKey) private var superblocks = false
@@ -64,6 +65,13 @@ struct SettingsView: View {
                         Text("120 Hz").tag(120)
                     }
                     .pickerStyle(.segmented)
+                    Picker("Guest CPU kick interval", selection: $kickIntervalMs) {
+                        Text("1 ms").tag(1)
+                        Text("2 ms").tag(2)
+                        Text("4 ms").tag(4)
+                    }
+                    Text("Henge periodically wakes guest CPUs to check timers and device work. A longer interval can reduce forced exits and scheduling overhead, but may slightly delay timer and device responses. Applies the next time a Mac starts.")
+                        .font(.footnote).foregroundStyle(.secondary)
                     Toggle("Faster disk writes", isOn: $fastFlush)
                     Toggle("Quicker wake from idle", isOn: $wfiSpin)
                     Toggle("Superblocks (experimental)", isOn: $superblocks)
