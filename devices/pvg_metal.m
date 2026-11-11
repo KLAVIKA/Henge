@@ -142,6 +142,8 @@ enum { OBJ_BUFFER = 1, OBJ_TEXTURE = 2, OBJ_FUNCTION = 6, OBJ_SERIALIZED = 7, OB
     /* Work the GPU has not finished. Stamps are given back in the order they came: the
        GPU's completion handlers run in the order of commit. */
     _Atomic int inflight;
+    _Atomic int stopping;
+    dispatch_group_t completions;
     _Atomic int queued_work, max_queued_work, max_inflight;
     _Atomic uint64_t worker_queue_wait_count, worker_queue_wait_ns, worker_queue_wait_max_ns;
     _Atomic uint64_t gpu_cb_done, gpu_cb_errors, gpu_cb_runtime_ns, gpu_cb_runtime_max_ns;
@@ -477,39 +479,36 @@ static void hv_dump_failed_library(NSData *lib, uint32_t task, uint64_t function
     if (hv_pvg_lite_task_read(lite, task, at, &h, sizeof h)) return nil;
     NSMutableData *lib = [NSMutableData dataWithLength:h.len];
     if (hv_pvg_lite_task_read(lite, task, h.off, lib.mutableBytes, h.len)) return nil;
-    /* iOS 17 refuses macOS's libraries as they are (a macOS 15 build, AIR 2.7): relabelled as iOS 17 ones
-       (devices/metallib.c), header first, then the bitcode's target too, it may load them. The stage that
-       worked is tried first from then on. HV_PVG_NO_RELABEL: never. */
-    static int start_stage = -1; /* 0: as sent; 1, 2: relabelled */
+    /* iOS 17 needs the module's LLVM target triple relabelled too; stage 2 is the first
+       stage that produces usable pipelines. Stage 3's version metadata downgrade is experimental
+       and is only selected explicitly with HV_PVG_RELABEL=3. */
+    static int start_stage = -1; /* 0: as sent; 1, 2, 3: relabelled */
     static int no_relabel = -1;
     if (no_relabel < 0) no_relabel = getenv("HV_PVG_NO_RELABEL") != NULL;
-    if (start_stage < 0) { /* HV_PVG_RELABEL=N (testing): every library relabelled at stage N from the start */
+    if (start_stage < 0) {
         const char *f = getenv("HV_PVG_RELABEL");
-        start_stage = f && atoi(f) >= 1 && atoi(f) <= 2 ? atoi(f) : 0;
+        int requested = f ? atoi(f) : 0;
+        start_stage = requested >= 1 && requested <= 3 ? requested : 0;
     }
     NSError *err = nil, *first_err = nil;
     id<MTLLibrary> library = nil;
-    for (int stage = no_relabel ? 0 : start_stage; stage <= (no_relabel ? 0 : 2) && !library; stage++) {
+    int last_stage = no_relabel ? 0 : start_stage >= 3 ? 3 : 2, loaded_at = -1;
+    for (int stage = no_relabel ? 0 : start_stage; stage <= last_stage && !library; stage = stage ? stage + 1 : 2) {
         NSMutableData *try = lib;
         if (stage) {
             try = [lib mutableCopy];
-            int triple_changes = 0;
-            char triple_before[96] = {0}, triple_after[96] = {0};
-            int fields_changed = hv_metallib_relabel(try.mutableBytes, try.length, stage,
-                                                     &triple_changes, triple_before, sizeof triple_before,
-                                                     triple_after, sizeof triple_after);
-            if (stage == 2) {
-                static unsigned relabel_diagnostics;
-                if (relabel_diagnostics++ < 64)
-                    fprintf(stderr, "hengevm: pvg-metal: relabel-detail task %u library-at %#llx bytes %u stage %d fields %d triple-rewrites %d before [%s] after [%s]\n",
-                            task, (unsigned long long)at, h.len, stage, fields_changed, triple_changes,
-                            triple_before[0] ? triple_before : "none", triple_after[0] ? triple_after : "none");
-            }
+            const char *why = NULL;
+            int fields_changed = hv_metallib_relabel(try.mutableBytes, try.length, stage, &why);
+            static unsigned relabel_diagnostics;
+            if (why && relabel_diagnostics++ < 64)
+                fprintf(stderr, "hengevm: pvg-metal: relabel-detail task %u library-at %#llx bytes %u stage %d fields %d reason [%s]\n",
+                        task, (unsigned long long)at, h.len, stage, fields_changed, why);
             if (fields_changed <= 0) continue;
         }
         dispatch_data_t data = dispatch_data_create(try.bytes, try.length, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
         err = nil;
         library = [device newLibraryWithData:data error:&err];
+        if (library) loaded_at = stage;
         if (!library && !first_err) first_err = err;
         if (library && (stage != start_stage || (stage && first_err == nil && !getenv("HV_PVG_RELABEL_QUIET")))) {
             [self complain:[NSString stringWithFormat:@"library: loaded relabelled for iOS 17 (stage %d; as sent: %@)", stage,
@@ -525,9 +524,12 @@ static void hv_dump_failed_library(NSData *lib, uint32_t task, uint64_t function
         [self complain:[NSString stringWithFormat:@"library: %@", failure.localizedDescription]];
         return nil;
     }
-    {   /* m4 fork: while tracing, keep each library macOS sends, to read its shaders on a Mac */
-        const char *tf = getenv("HV_PVG_TRACE_FILE");
-        if (tf && getenv("HV_SHADER_DUMP") && atoi(getenv("HV_SHADER_DUMP"))) {
+    {   /* Keep source libraries for shader analysis. HV_SHADER_DUMP=0 disables the default sample. */
+        static int relabelled_kept = 0;
+        const char *tf = getenv("HV_PVG_TRACE_FILE"), *sd = getenv("HV_SHADER_DUMP");
+        int keep = sd ? atoi(sd) != 0 : loaded_at > 0 && relabelled_kept < 48;
+        if (keep && !sd) relabelled_kept++;
+        if (tf && keep) {
             NSString *dir = [[[NSString stringWithUTF8String:tf] stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"shaders"];
             [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
             NSString *name = [NSString stringWithFormat:@"%@-%llx.metallib", library.functionNames.firstObject ?: @"lib", (unsigned long long)at];
@@ -2046,6 +2048,7 @@ typedef struct {
     int pending = atomic_fetch_add(&inflight, 1) + 1;
     metric_max_int(&max_inflight, pending);
     double submitted_at = now_seconds();
+    dispatch_group_enter(completions);
     [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
         double completed_at = now_seconds();
         atomic_fetch_add(&self->gpu_cb_done, 1);
@@ -2075,6 +2078,7 @@ typedef struct {
         }
         if (complete) hv_pvg_lite_complete(l, ch, stamp);
         atomic_fetch_sub(&self->inflight, 1);
+        dispatch_group_leave(self->completions);
     }];
     [cb commit];
     last_cb = cb;
@@ -2500,6 +2504,7 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
    this only says what to show next. Whatever is newest when a drawable comes is what is shown. */
 - (void)kickPresenter:(BOOL)fresh {
     /* screen_lock held */
+    if (atomic_load(&stopping)) return;
     if (fresh) {
         screen_requests++;
         last_screen_kick = now_seconds();
@@ -2531,6 +2536,7 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
 }
 
 - (void)showOnLayer:(uint64_t)mapping {
+    if (atomic_load(&stopping)) return;
     HvObject *surface = surfaces[@(mapping)];
     if (!surface) {
         static unsigned unknown;
@@ -2574,6 +2580,12 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
 
 - (void)presentLoop {
     for (;;) @autoreleasepool {
+        if (atomic_load(&stopping)) {
+            os_unfair_lock_lock(&screen_lock);
+            presenter_running = NO;
+            os_unfair_lock_unlock(&screen_lock);
+            return;
+        }
         os_unfair_lock_lock(&screen_lock);
         if (!screen_dirty || !layer) {
             presenter_running = NO;
@@ -2712,6 +2724,7 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
             [b copyFromTexture:drawable.texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(W, H, 1)
                       toBuffer:rb destinationOffset:0 destinationBytesPerRow:(NSUInteger)W * 4 destinationBytesPerImage:bytes];
             [b endEncoding];
+            dispatch_group_enter(completions);
             [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
                 (void)done;
                 dispatch_async(self->worker, ^{
@@ -2721,6 +2734,7 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
                     memcpy(self->frame, rb.contents, (size_t)W * H * 4);
                     self->frames++;
                 });
+                dispatch_group_leave(self->completions);
             }];
         }
 #endif
@@ -2745,6 +2759,7 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
             }
             last_present_submit = present_submitted_at;
             atomic_fetch_add(&present_submit_count, 1);
+            dispatch_group_enter(completions);
             [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
                 double completed_at = now_seconds();
                 atomic_fetch_add(&self->present_done_count, 1);
@@ -2757,6 +2772,7 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
                 }
                 if (completed_at >= present_submitted_at)
                     metric_max_u64(&self->present_gpu_latency_max_ns, (uint64_t)((completed_at - present_submitted_at) * 1e9));
+                dispatch_group_leave(self->completions);
             }];
             [cb presentDrawable:drawable];
             [cb commit];
@@ -2770,6 +2786,7 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
 
 /* What the display should show: at most a few times a second by CPU, for tests and the boot's first frames. */
 - (void)present:(uint64_t)mapping {
+    if (atomic_load(&stopping)) return;
     static unsigned present_logs;
     double now = now_seconds();
     on_screen = mapping;
@@ -2873,6 +2890,7 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
         if (proto) class_addProtocol([HvContext class], proto);
         HvReplay *r = [HvReplay new];
         r->lite = lite;
+        r->completions = dispatch_group_create();
         r->device = dev;
         r->queue = [dev newCommandQueueWithMaxCommandBufferCount:64];
         r->worker = dispatch_queue_create("hengevm.pvg", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
@@ -2902,6 +2920,141 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
 #endif
         fprintf(stderr, "hengevm: pvg-metal: drawing on %s\n", dev.name.UTF8String);
         return (HvPvgMetal *)CFBridgingRetain(r);
+    }
+}
+
+
+/* Stop only after the guest CPUs have halted. Finish the worker queue and every submitted Metal
+   command buffer, then copy GPU-private, guest-backed objects into guest RAM so resume sees them. */
+void hv_pvg_metal_quiesce(HvPvgMetal *m) {
+    if (!m) return;
+    HvReplay *r = (__bridge HvReplay *)m;
+    @autoreleasepool {
+        dispatch_sync(r->worker, ^{});
+        dispatch_group_wait(r->completions, DISPATCH_TIME_FOREVER);
+        dispatch_sync(r->worker, ^{
+            id<MTLCommandBuffer> cb = nil;
+            id<MTLBlitCommandEncoder> blit = nil;
+            unsigned copied = 0;
+            for (NSNumber *task in r->tasks) {
+                NSMutableDictionary<NSNumber *, HvObject *> *objs = r->tasks[task];
+                for (NSNumber *ref in objs) {
+                    HvObject *o = objs[ref];
+                    if (!o->guest_backed || !o->host_valid || !o->guest_stale) continue;
+                    if (o->parent && o->parent->heap_whole) continue;
+                    if (!cb) cb = [r->queue commandBuffer];
+                    [r page:o toGuest:YES task:task.unsignedIntValue blit:&blit commandBuffer:cb];
+                    o->guest_stale = NO;
+                    copied++;
+                }
+            }
+            [blit endEncoding];
+            if (cb) {
+                [cb commit];
+                [cb waitUntilCompleted];
+            }
+            fprintf(stderr, "hengevm: pvg-metal: quiesced, %u GPU-only objects copied to guest memory\n", copied);
+        });
+        dispatch_group_wait(r->completions, DISPATCH_TIME_FOREVER);
+    }
+}
+
+typedef struct DisplayState {
+    uint64_t on_screen;
+    uint32_t cursor_w, cursor_h, cursor_stride, cursor_shown;
+    int32_t hot_x, hot_y;
+} DisplayState;
+
+size_t hv_pvg_metal_display_state(HvPvgMetal *m, void *out, size_t cap) {
+    if (!m) return 0;
+    HvReplay *r = (__bridge HvReplay *)m;
+    __block size_t need = 0;
+    dispatch_sync(r->worker, ^{
+        os_unfair_lock_lock(&r->screen_lock);
+        size_t bits = r->cursor ? (size_t)r->cursor_stride * r->cursor_h : 0;
+        need = sizeof(DisplayState) + bits;
+        if (out && cap >= need) {
+            DisplayState d = {.on_screen = r->on_screen, .cursor_w = bits ? r->cursor_w : 0,
+                              .cursor_h = bits ? r->cursor_h : 0, .cursor_stride = bits ? r->cursor_stride : 0,
+                              .cursor_shown = r->cursor_shown, .hot_x = r->cursor_hot_x, .hot_y = r->cursor_hot_y};
+            memcpy(out, &d, sizeof d);
+            if (bits) memcpy((uint8_t *)out + sizeof d, r->cursor, bits);
+        }
+        os_unfair_lock_unlock(&r->screen_lock);
+    });
+    return need;
+}
+
+void hv_pvg_metal_set_display_state(HvPvgMetal *m, const void *in, size_t len) {
+    if (!m || !in || len < sizeof(DisplayState)) return;
+    HvReplay *r = (__bridge HvReplay *)m;
+    DisplayState d;
+    memcpy(&d, in, sizeof d);
+    size_t bits = (size_t)d.cursor_stride * d.cursor_h;
+    if (len < sizeof d + bits || d.cursor_w > 512 || d.cursor_h > 512 ||
+        (bits && d.cursor_stride < d.cursor_w * 4)) bits = 0;
+    uint8_t *copy = bits ? malloc(bits) : NULL;
+    if (copy) memcpy(copy, (const uint8_t *)in + sizeof d, bits);
+    dispatch_sync(r->worker, ^{
+        @autoreleasepool {
+            id<MTLTexture> glyph = nil;
+            if (copy) {
+                MTLTextureDescriptor *ct = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                                              width:d.cursor_w height:d.cursor_h mipmapped:NO];
+                ct.storageMode = MTLStorageModeShared;
+                glyph = [r->device newTextureWithDescriptor:ct];
+                [glyph replaceRegion:MTLRegionMake2D(0, 0, d.cursor_w, d.cursor_h) mipmapLevel:0
+                            withBytes:copy bytesPerRow:d.cursor_stride];
+            }
+            os_unfair_lock_lock(&r->screen_lock);
+            if (copy) {
+                free(r->cursor);
+                r->cursor = copy, r->cursor_w = d.cursor_w, r->cursor_h = d.cursor_h, r->cursor_stride = d.cursor_stride;
+                r->cursor_hot_x = d.hot_x, r->cursor_hot_y = d.hot_y;
+                r->cursor_tex = glyph;
+            }
+            r->cursor_shown = d.cursor_shown != 0;
+            os_unfair_lock_unlock(&r->screen_lock);
+            r->on_screen = d.on_screen;
+            if (d.on_screen) [r present:d.on_screen];
+            [r drawCursor];
+        }
+    });
+}
+
+void hv_pvg_metal_destroy(HvPvgMetal *m) {
+    if (!m) return;
+    @autoreleasepool {
+        HvReplay *r = CFBridgingRelease(m);
+        atomic_store(&r->stopping, 1);
+        if (r->shot_timer) { dispatch_source_cancel(r->shot_timer); r->shot_timer = nil; }
+        os_unfair_lock_lock(&r->screen_lock);
+        r->layer = nil;
+        r->layer_generation++;
+        r->screen_dirty = NO;
+        os_unfair_lock_unlock(&r->screen_lock);
+        dispatch_sync(r->worker, ^{ r->late = NO; });
+        dispatch_sync(r->presenter, ^{});
+        id<MTLCommandBuffer> fence = [r->queue commandBuffer];
+        [fence commit];
+        [fence waitUntilCompleted];
+        dispatch_group_wait(r->completions, DISPATCH_TIME_FOREVER);
+        dispatch_sync(r->worker, ^{
+            r->lite = NULL;
+            r->tasks = nil;
+            r->surfaces = nil;
+            r->mapped_textures = nil;
+            r->planar = nil;
+            r->planar_uses = nil;
+            r->complaints = nil;
+            r->screen_tex = nil;
+            r->cursor_tex = nil;
+            r->last_cb = nil;
+            r->readback = r->test_readback = nil;
+            free(r->frame); r->frame = NULL;
+            free(r->base); r->base = NULL;
+            free(r->cursor); r->cursor = NULL;
+        });
     }
 }
 

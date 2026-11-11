@@ -35,13 +35,27 @@
 #include <os/lock.h>
 #include <stdatomic.h>
 #include "pvg_lite.h"
+#include <mach/mach_time.h>
+
+int hv_pvg_trace_on(void) {
+    static const char *tf;
+    static int read, on;
+    static _Atomic uint64_t next;
+    if (!read) read = 1, tf = getenv("HV_PVG_TRACE_FILE");
+    if (!tf) return 0;
+    uint64_t now = mach_absolute_time();
+    if (now >= atomic_load_explicit(&next, memory_order_relaxed)) {
+        on = access(tf, F_OK) == 0;
+        atomic_store_explicit(&next, now + 2400000, memory_order_relaxed); /* 100 ms of 24 MHz ticks */
+    }
+    return on;
+}
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "../core/machine.h"
-#include "../host/vm.h"
 
 #define MAX_CHANNELS 16
 
@@ -61,13 +75,12 @@ struct HvPvgLite {
     uint32_t draining;
     uint32_t barrier_waits[MAX_CHANNELS];
     uint64_t barriers, barrier_drains, barrier_retries, barrier_timeouts;
-    /* Monotonic order of device-side mapper and channel events, assigned under dev_mu. */
-    uint64_t diag_sequence, barrier_block_sequence[MAX_CHANNELS];
     CFTypeRef layer; /* retained until replaced; layer_lock serializes lazy replay handoff */
     os_unfair_lock layer_lock;
     int layer_set; /* an explicit NULL also overrides the renderer's Mac test layer */
     uint32_t task_root[512]; /* page of each task's root, by the id in commands */
     uint64_t task_objects[512], task_placement[512]; /* task offsets of its object lists */
+    int old_driver; /* macOS 14's (and older?) GPU driver: object lists at a fixed place, compact surface descriptions */
     uint8_t obj_seen[512][8192];
     int tally;
     uint64_t counts[6][256];
@@ -343,9 +356,22 @@ void *hv_pvg_lite_phys(HvPvgLite *p, uint64_t pa, uint64_t length) {
     return hv_phys_ptr(p->m, pa, length);
 }
 
+/* macOS 15 and later name each task's object list with command 0x44. Older guest drivers (macOS 14 Sonoma
+   seen) never send it: their list is at task offset 0x4000, the same 12-byte entries (found by probing). */
+#define OLD_DRIVER_OBJECTS 0x4000
 uint64_t hv_pvg_lite_task_objects(HvPvgLite *p, uint32_t task) {
-    return task < 512 ? p->task_objects[task] : 0;
+    if (task >= 512) return 0;
+    if (!p->task_objects[task] && p->task_root[task]) {
+        if (!p->old_driver) {
+            p->old_driver = 1;
+            fprintf(stderr, "hengevm: pvg-lite: an older guest GPU driver (no object list command): its own layouts\n");
+        }
+        return OLD_DRIVER_OBJECTS;
+    }
+    return p->task_objects[task];
 }
+
+int hv_pvg_lite_old_driver(HvPvgLite *p) { return p->old_driver; }
 
 /* A stamp Metal finished: the guest sees it and the next poll raises the interrupt. */
 void hv_pvg_lite_complete(HvPvgLite *p, uint32_t ch, uint32_t stamp) {
@@ -494,6 +520,19 @@ static void channel_command(HvPvgLite *p, const uint32_t *table, uint32_t size, 
     uint32_t op = hdr[0] & 0xffff, args[32], skip = (hdr[0] >> 16) * 8; /* the barriers come first */
     uint32_t n = hdr[1] > 12 + skip ? hdr[1] - 12 - skip : 0;
     if (n > sizeof args) n = sizeof args;
+    {   /* HV_PVG_OPS=1: the first of each channel command the guest sends, with its words (a driver whose commands differ) */
+        static int on = -1;
+        static uint8_t seen[0x10000 / 8];
+        if (on < 0) on = getenv("HV_PVG_OPS") != NULL;
+        if (on && !(seen[op / 8] & (1 << (op % 8)))) {
+            seen[op / 8] |= (uint8_t)(1 << (op % 8));
+            uint32_t w[16] = {0};
+            ring_read(p, table, size, rd + 12 + skip, w, n < sizeof w ? n : sizeof w);
+            fprintf(stderr, "pvgop 0x%x len %u skip %u:", op, hdr[1], skip);
+            for (uint32_t i = 0; i < 16 && i * 4 < n; i++) fprintf(stderr, " %08x", w[i]);
+            fprintf(stderr, "\n");
+        }
+    }
     if (op == 0x38) {
         ring_read(p, table, size, rd + 12 + skip, args, 16);
         if (args[0] >> 1 < 512) p->task_root[args[0] >> 1] = args[3];
@@ -518,13 +557,15 @@ static void channel_command(HvPvgLite *p, const uint32_t *table, uint32_t size, 
     else display_swap(p, (uint64_t)args[3] << 32 | args[2], args);
 }
 
-/* The mapper's table: a u32 per 16 KB of descriptors (16 of them), physical
-   address >> 12 with bit 0 meaning present. */
+/* The mapper's table: a u32 per 16 KB of descriptors, physical address >> 12 with bit 0 meaning present. */
 const uint8_t *hv_pvg_lite_surface(HvPvgLite *p, uint32_t mapping) {
+    /* macOS 14's driver writes 0x200-byte descriptions, 32 to a page; later ones 0x400, 16 to a page. Reading the
+       older ones as 0x400 apart put id 2k on the first half of "slot" k and never read id 2k+1 at all. */
+    uint32_t per = p->old_driver ? 32 : 16, size = 0x4000 / per;
     uint64_t table = p->io_regs[0x10 / 8];
-    uint32_t *e = table ? hv_phys_ptr(p->m, table + (mapping / 16) * 4ull, 4) : NULL;
+    uint32_t *e = table ? hv_phys_ptr(p->m, table + (mapping / per) * 4ull, 4) : NULL;
     if (!e || !(*e & 1)) return NULL;
-    return hv_phys_ptr(p->m, ((uint64_t)(*e & ~1u) << 12) + (mapping % 16) * 0x400ull, 0x400);
+    return hv_phys_ptr(p->m, ((uint64_t)(*e & ~1u) << 12) + (mapping % per) * (uint64_t)size, size);
 }
 
 uint8_t *hv_pvg_lite_display_page(HvPvgLite *p) {
@@ -538,6 +579,18 @@ void hv_pvg_lite_command(HvPvgLite *p, const uint32_t *cmd, uint32_t len) {
     if (op == 1 && n >= 8) display_set_page(p, (uint64_t)args[1] << 14);
     else if (op == 2 && n >= 8) display_ack(p, args[1]);
     else if (op == 8 && n >= 16) display_swap(p, (uint64_t)args[3] << 32 | args[2], args);
+}
+
+/* The Metal side, made the first time the guest's GPU work needs it. */
+static void ensure_metal(HvPvgLite *p) {
+    os_unfair_lock_lock(&p->layer_lock);
+    if (!p->metal_tried) {
+        p->metal_tried = 1;
+        HvPvgMetal *metal = getenv("HV_PVG_NO_METAL") ? NULL : hv_pvg_metal_create(p);
+        if (metal && p->layer_set) hv_pvg_metal_set_layer(metal, (void *)p->layer);
+        atomic_store_explicit(&p->metal, metal, memory_order_release);
+    }
+    os_unfair_lock_unlock(&p->layer_lock);
 }
 
 static void do_channel(HvPvgLite *p, uint32_t ch) {
@@ -568,22 +621,13 @@ static void do_channel(HvPvgLite *p, uint32_t ch) {
         }
         if (p->log) fprintf(stderr, "hengevm: pvg-lite: ch %u op %x len %x stamp %x\n", ch, hdr[0], hdr[1], hdr[2]);
         {   /* HV_PVG_TRACE_FILE exists: the order commands reach the device in, with what a swap says */
-            static const char *tf; static int tf_read;
-            if (!tf_read) tf_read = 1, tf = getenv("HV_PVG_TRACE_FILE");
-            if (tf && access(tf, F_OK) == 0) {
+            if (hv_pvg_trace_on()) {
                 uint32_t w[12] = {0};
                 ring_read(p, table, size, rd + 12, w, hdr[1] - 12 < sizeof w ? hdr[1] - 12 : sizeof w);
                 fprintf(stderr, "trace: dev ch %u op %x len %u stamp %x sub %x args %x %x %x %x %x %x %x %x\n", ch, hdr[0], hdr[1], hdr[2], p->submitted[ch], w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
             }
         }
-        os_unfair_lock_lock(&p->layer_lock);
-        if (!p->metal_tried) {
-            p->metal_tried = 1;
-            HvPvgMetal *metal = getenv("HV_PVG_NO_METAL") ? NULL : hv_pvg_metal_create(p);
-            if (metal && p->layer_set) hv_pvg_metal_set_layer(metal, (void *)p->layer);
-            atomic_store_explicit(&p->metal, metal, memory_order_release);
-        }
-        os_unfair_lock_unlock(&p->layer_lock);
+        ensure_metal(p);
         int blocked = 0;
         for (uint32_t k = 0; p->metal && k < hdr[0] >> 16 && !blocked; k++) {
             /* {channel, stamp}, as many as bits 31..16 say: this waits for that channel's
@@ -601,12 +645,6 @@ static void do_channel(HvPvgLite *p, uint32_t ch) {
                 if ((int32_t)(p->submitted[b[0]] - b[1]) < 0) {
                     if (++p->barrier_waits[ch] < 20000) { /* not written yet: this channel waits for a later poll */
                         p->barrier_retries++;
-                        if (!p->barrier_block_sequence[ch]) {
-                            p->barrier_block_sequence[ch] = ++p->diag_sequence;
-                            fprintf(stderr, "hengevm: pvg-order: barrier-block seq %llu ch %u rd %#x op %#x stamp %#x waits ch %u stamp %#x submitted %#x\n",
-                                    (unsigned long long)p->barrier_block_sequence[ch], ch, rd, hdr[0] & 0xffff, hdr[2],
-                                    b[0], b[1], p->submitted[b[0]]);
-                        }
                         p->chan_pending |= 1u << ch;
                         blocked = 1;
                         break;
@@ -621,19 +659,9 @@ static void do_channel(HvPvgLite *p, uint32_t ch) {
         channel_command(p, table, size, rd, hdr);
         p->submitted[ch] = hdr[2];
         if (p->metal) {
-            uint64_t blocked_seq = p->barrier_block_sequence[ch];
-            p->barrier_block_sequence[ch] = 0;
-            uint64_t sequence = ++p->diag_sequence;
-            if (blocked_seq)
-                fprintf(stderr, "hengevm: pvg-order: barrier-release seq %llu ch %u rd %#x blocked-seq %llu op %#x stamp %#x\n",
-                        (unsigned long long)sequence, ch, rd, (unsigned long long)blocked_seq, hdr[0] & 0xffff, hdr[2]);
-            static unsigned command_logs;
-            if (command_logs++ < 256)
-                fprintf(stderr, "hengevm: pvg-order: enqueue seq %llu ch %u rd %#x op %#x stamp %#x len %u\n",
-                        (unsigned long long)sequence, ch, rd, hdr[0] & 0xffff, hdr[2], hdr[1]);
             uint32_t *copy = malloc(hdr[1]);
             ring_read(p, table, size, rd, copy, hdr[1]);
-            hv_pvg_metal_submit(p->metal, p, ch, sequence, copy, hdr[1]);
+            hv_pvg_metal_submit(p->metal, p, ch, copy, hdr[1]);
         } else {
             last = hdr[2], any = 1;
         }
@@ -650,22 +678,16 @@ static void do_channel(HvPvgLite *p, uint32_t ch) {
 
 /* The mapper's ring: surfaces coming and going. The guest waits for its interrupt. */
 static void do_mapper(HvPvgLite *p) {
-    static unsigned summary_logs, event_logs;
-    uint64_t ring = p->io_regs[0], table = p->io_regs[0x10 / 8];
-    uint64_t size = p->io_regs[0x8 / 8], want = p->io_regs[0x18 / 8], read = p->io_regs[0x20 / 8];
-    if (summary_logs++ < 24)
-        fprintf(stderr, "hengevm: pvg-lite: mapper doorbell read %llu want %llu ring %#llx size %llu table %#llx\n",
-                (unsigned long long)read, (unsigned long long)want, (unsigned long long)ring,
-                (unsigned long long)size, (unsigned long long)table);
     if (p->tally) {
-        for (uint64_t i = read; i < want && size; i++) {
+        uint64_t ring = p->io_regs[0], table = p->io_regs[0x10 / 8], size = p->io_regs[0x8 / 8], want = p->io_regs[0x18 / 8];
+        for (uint64_t i = p->io_regs[0x20 / 8]; i < want && size; i++) {
             uint32_t *e = hv_phys_ptr(p->m, ring + (i % size) * 16, 16);
             uint32_t *t = table ? hv_phys_ptr(p->m, table, 64) : NULL;
             if (!e || !t) continue;
             fprintf(stderr, "pvgmap op %u id %u table %x %x %x %x\n", e[0], e[1], t[0], t[1], t[2], t[3]);
             uint32_t seg = e[1] / 16, idx = e[1] % 16;
             uint32_t *ta = hv_phys_ptr(p->m, table + seg * 4, 4);
-            uint32_t *d = ta && (*ta & 1) ? hv_phys_ptr(p->m, ((uint64_t)(*ta & ~1u) << 12) + idx * 0x400ull, 0x400) : NULL;
+            uint32_t *d = ta ? hv_phys_ptr(p->m, ((uint64_t)(*ta & ~1u) << 12) + idx * 0x400ull, 0x400) : NULL;
             if (d && e[0] == 1) {
                 fprintf(stderr, "pvgdesc");
                 for (int k = 0; k < 64; k++) fprintf(stderr, " %08x", d[k]);
@@ -674,33 +696,10 @@ static void do_mapper(HvPvgLite *p) {
         }
     }
     if (p->metal) {
-        for (uint64_t i = read; i < want && size; i++) {
+        uint64_t ring = p->io_regs[0], size = p->io_regs[0x8 / 8], want = p->io_regs[0x18 / 8];
+        for (uint64_t i = p->io_regs[0x20 / 8]; i < want && size; i++) {
             uint32_t *e = hv_phys_ptr(p->m, ring + (i % size) * 16, 16);
-            if (!e) continue;
-            uint64_t sequence = ++p->diag_sequence;
-            if (event_logs++ < 256) {
-                uint32_t seg = e[1] / 16, idx = e[1] % 16;
-                uint32_t *ta = table ? hv_phys_ptr(p->m, table + seg * 4, 4) : NULL;
-                uint32_t entry = ta ? *ta : 0;
-                uint32_t *d = ta && (entry & 1)
-                    ? hv_phys_ptr(p->m, ((uint64_t)(entry & ~1u) << 12) + idx * 0x400ull, 0x400) : NULL;
-                fprintf(stderr, "hengevm: pvg-order: mapper seq %llu op %u id %u table-entry %#x descriptor %s\n",
-                        (unsigned long long)sequence, e[0], e[1], entry, d ? "present" : "missing");
-                if (d && e[0] == 1) {
-                    uint32_t fourcc, first;
-                    uint64_t alloc, width, height, row;
-                    memcpy(&fourcc, d + 4, 4);
-                    memcpy(&alloc, d + 0x18, 8);
-                    memcpy(&width, d + 0x20, 8);
-                    memcpy(&height, d + 0x28, 8);
-                    memcpy(&row, d + 0x30, 8);
-                    memcpy(&first, d + 0x60, 4);
-                    fprintf(stderr, "hengevm: pvg-lite: map descriptor id %u fourcc %#x size %llux%llu row %llu alloc %llu first %u planes %u\n",
-                            e[1], fourcc, (unsigned long long)width, (unsigned long long)height,
-                            (unsigned long long)row, (unsigned long long)alloc, first, d[0x3e]);
-                }
-            }
-            if (e[0] == 2) hv_pvg_metal_unmap(p->metal, e[1], sequence);
+            if (e && e[0] == 2) hv_pvg_metal_unmap(p->metal, e[1]);
         }
     }
     p->io_regs[0x20 / 8] = p->io_regs[0x18 / 8];
@@ -753,10 +752,7 @@ static void gfx_write(void *opaque, uint64_t off, uint64_t v, unsigned size) {
     } else if (p->log && off != 0x1020) {
         fprintf(stderr, "hengevm: pvg-lite: write +%llx = %llx\n", (unsigned long long)off, (unsigned long long)v);
     }
-    if (off == 0x1220 && p->metal) {
-        hv_vm_note_pointer_response();
-        hv_pvg_metal_cursor_moved(p->metal); /* the display's doorbell: the pointer moved */
-    }
+    if (off == 0x1220 && p->metal) hv_pvg_metal_cursor_moved(p->metal); /* the display's doorbell: the pointer moved */
 }
 
 static uint64_t iosfc_read(void *opaque, uint64_t off, unsigned size) {
@@ -786,4 +782,78 @@ HvPvgLite *hv_pvg_lite_create(HvMachine *m, HvGic *gic, uint64_t gfx_pa, uint64_
     hv_machine_add_mmio(m, gfx_pa, 0x10000, p, gfx_read, gfx_write, "gfx");
     hv_machine_add_mmio(m, iosfc_pa, 0x10000, p, iosfc_read, iosfc_write, "iosurface");
     return p;
+}
+
+void hv_pvg_lite_destroy(HvPvgLite *p) {
+    if (!p) return;
+    hv_pvg_metal_destroy(atomic_exchange(&p->metal, NULL));
+    if (p->layer) CFRelease(p->layer);
+    free(p);
+}
+
+/* Instant resume. What the device keeps outside guest memory; its Metal side is not in it: that is made again from
+   guest memory as the guest uses it, once hv_pvg_lite_quiesce has put back what only the GPU held. */
+typedef struct PvgState {
+    uint32_t regs[0x1000 / 4];
+    uint64_t io_regs[0x40 / 8];
+    uint32_t root_rp, status, chan_pending, draining, stamps_pending;
+    int root_pending, iosfc_pending, old_driver;
+    uint64_t display_pa, swaps;
+    uint32_t submitted[MAX_CHANNELS], barrier_waits[MAX_CHANNELS];
+    uint32_t task_root[512];
+    uint64_t task_objects[512], task_placement[512];
+} PvgState;
+
+size_t hv_pvg_lite_state(HvPvgLite *p, void *out, size_t cap) {
+    if (!out || cap < sizeof(PvgState)) return sizeof(PvgState);
+    PvgState *s = out;
+    memset(s, 0, sizeof *s);
+    memcpy(s->regs, p->regs, sizeof s->regs);
+    memcpy(s->io_regs, p->io_regs, sizeof s->io_regs);
+    s->root_rp = p->root_rp, s->status = __atomic_load_n(&p->status, __ATOMIC_ACQUIRE), s->chan_pending = p->chan_pending;
+    s->draining = p->draining, s->stamps_pending = p->stamps_pending;
+    s->root_pending = p->root_pending, s->iosfc_pending = p->iosfc_pending, s->old_driver = p->old_driver;
+    s->display_pa = p->display_pa, s->swaps = p->swaps;
+    memcpy(s->submitted, p->submitted, sizeof s->submitted);
+    memcpy(s->barrier_waits, p->barrier_waits, sizeof s->barrier_waits);
+    memcpy(s->task_root, p->task_root, sizeof s->task_root);
+    memcpy(s->task_objects, p->task_objects, sizeof s->task_objects);
+    memcpy(s->task_placement, p->task_placement, sizeof s->task_placement);
+    return sizeof(PvgState);
+}
+
+int hv_pvg_lite_set_state(HvPvgLite *p, const void *in, size_t len) {
+    if (len != sizeof(PvgState)) return -1;
+    const PvgState *s = in;
+    memcpy(p->regs, s->regs, sizeof s->regs);
+    memcpy(p->io_regs, s->io_regs, sizeof s->io_regs);
+    p->root_rp = s->root_rp, p->status = s->status, p->chan_pending = s->chan_pending;
+    p->draining = s->draining, p->stamps_pending = s->stamps_pending;
+    p->root_pending = s->root_pending, p->iosfc_pending = s->iosfc_pending, p->old_driver = s->old_driver;
+    p->display_pa = s->display_pa, p->swaps = s->swaps;
+    memcpy(p->submitted, s->submitted, sizeof s->submitted);
+    memcpy(p->barrier_waits, s->barrier_waits, sizeof s->barrier_waits);
+    memcpy(p->task_root, s->task_root, sizeof s->task_root);
+    memcpy(p->task_objects, s->task_objects, sizeof s->task_objects);
+    memcpy(p->task_placement, s->task_placement, sizeof s->task_placement);
+    return 0;
+}
+
+/* CPUs stopped: the GPU's queued work done, and what only it holds copied into guest memory. */
+void hv_pvg_lite_quiesce(HvPvgLite *p) {
+    HvPvgMetal *metal = p ? atomic_load_explicit(&p->metal, memory_order_acquire) : NULL;
+    if (metal) hv_pvg_metal_quiesce(metal);
+}
+
+size_t hv_pvg_lite_display_state(HvPvgLite *p, void *out, size_t cap) {
+    HvPvgMetal *metal = p ? atomic_load_explicit(&p->metal, memory_order_acquire) : NULL;
+    return metal ? hv_pvg_metal_display_state(metal, out, cap) : 0;
+}
+
+/* After hv_pvg_lite_set_state: the screen and the pointer as they were, before the guest draws again. */
+void hv_pvg_lite_set_display_state(HvPvgLite *p, const void *in, size_t len) {
+    if (!p || !len) return;
+    ensure_metal(p);
+    HvPvgMetal *metal = atomic_load_explicit(&p->metal, memory_order_acquire);
+    if (metal) hv_pvg_metal_set_display_state(metal, in, len);
 }
