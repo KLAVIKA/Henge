@@ -12,7 +12,7 @@ struct SettingsView: View {
     @AppStorage(EngineTuning.wfiSpinKey) private var wfiSpin = false
     @AppStorage(EngineTuning.superblocksKey) private var superblocks = false
     @AppStorage(JITBootstrap.codeCacheKey) private var codeCacheMB = JITBootstrap.defaultCodeCacheMB
-    @AppStorage(InstantResume.key) private var instantResume = true
+    @AppStorage(InstantResume.key) private var instantResume = false
 
     var body: some View {
         NavigationStack {
@@ -86,9 +86,9 @@ struct SettingsView: View {
                         .font(.footnote).foregroundStyle(.secondary)
                 }
                 .listRowBackground(Desk.card)
-                Section("Instant Resume") {
-                    Toggle("Resume where you left off", isOn: $instantResume)
-                    Text("When Henge leaves the foreground, the Mac pauses before iOS suspends GPU work. In the background, Henge saves the paused Mac so it can be restored if iOS closes the app. A saved Mac can be resumed only with the same Henge build and an unchanged disk.")
+                Section("Background") {
+                    Toggle("Save Mac if Henge is closed", isOn: $instantResume)
+                    Text("Henge always pauses the Mac when the app becomes inactive and resumes it when you return. This option additionally saves a background snapshot so iOS can close Henge without losing the session. Snapshot restore is experimental until all Metal objects have been re-created and verified.")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
                 .listRowBackground(Desk.card)
