@@ -7,7 +7,7 @@ import UIKit
 /// file once; this side decides when to save, and says which build and settings a file belongs to.
 enum InstantResume {
     static let key = "henge.instantResume"
-    static var enabled: Bool { UserDefaults.standard.bool(forKey: key) }
+    static var enabled: Bool { (UserDefaults.standard.object(forKey: key) as? Bool) ?? true }
 
     /// Saving and running on take turns on one queue, never on the main thread: a save takes a few seconds.
     private static let queue = DispatchQueue(label: "henge.instant-resume", qos: .userInitiated)
