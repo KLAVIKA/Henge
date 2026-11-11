@@ -477,39 +477,36 @@ static void hv_dump_failed_library(NSData *lib, uint32_t task, uint64_t function
     if (hv_pvg_lite_task_read(lite, task, at, &h, sizeof h)) return nil;
     NSMutableData *lib = [NSMutableData dataWithLength:h.len];
     if (hv_pvg_lite_task_read(lite, task, h.off, lib.mutableBytes, h.len)) return nil;
-    /* iOS 17 refuses macOS's libraries as they are (a macOS 15 build, AIR 2.7): relabelled as iOS 17 ones
-       (devices/metallib.c), header first, then the bitcode's target too, it may load them. The stage that
-       worked is tried first from then on. HV_PVG_NO_RELABEL: never. */
-    static int start_stage = -1; /* 0: as sent; 1, 2: relabelled */
+    /* iOS 17 needs the module's LLVM target triple relabelled too; stage 2 is the first
+       stage that produces usable pipelines. Stage 3's version metadata downgrade is experimental
+       and is only selected explicitly with HV_PVG_RELABEL=3. */
+    static int start_stage = -1; /* 0: as sent; 1, 2, 3: relabelled */
     static int no_relabel = -1;
     if (no_relabel < 0) no_relabel = getenv("HV_PVG_NO_RELABEL") != NULL;
-    if (start_stage < 0) { /* HV_PVG_RELABEL=N (testing): every library relabelled at stage N from the start */
+    if (start_stage < 0) {
         const char *f = getenv("HV_PVG_RELABEL");
-        start_stage = f && atoi(f) >= 1 && atoi(f) <= 2 ? atoi(f) : 0;
+        int requested = f ? atoi(f) : 0;
+        start_stage = requested >= 1 && requested <= 3 ? requested : 0;
     }
     NSError *err = nil, *first_err = nil;
     id<MTLLibrary> library = nil;
-    for (int stage = no_relabel ? 0 : start_stage; stage <= (no_relabel ? 0 : 2) && !library; stage++) {
+    int last_stage = no_relabel ? 0 : start_stage >= 3 ? 3 : 2, loaded_at = -1;
+    for (int stage = no_relabel ? 0 : start_stage; stage <= last_stage && !library; stage = stage ? stage + 1 : 2) {
         NSMutableData *try = lib;
         if (stage) {
             try = [lib mutableCopy];
-            int triple_changes = 0;
-            char triple_before[96] = {0}, triple_after[96] = {0};
-            int fields_changed = hv_metallib_relabel(try.mutableBytes, try.length, stage,
-                                                     &triple_changes, triple_before, sizeof triple_before,
-                                                     triple_after, sizeof triple_after);
-            if (stage == 2) {
-                static unsigned relabel_diagnostics;
-                if (relabel_diagnostics++ < 64)
-                    fprintf(stderr, "hengevm: pvg-metal: relabel-detail task %u library-at %#llx bytes %u stage %d fields %d triple-rewrites %d before [%s] after [%s]\n",
-                            task, (unsigned long long)at, h.len, stage, fields_changed, triple_changes,
-                            triple_before[0] ? triple_before : "none", triple_after[0] ? triple_after : "none");
-            }
+            const char *why = NULL;
+            int fields_changed = hv_metallib_relabel(try.mutableBytes, try.length, stage, &why);
+            static unsigned relabel_diagnostics;
+            if (why && relabel_diagnostics++ < 64)
+                fprintf(stderr, "hengevm: pvg-metal: relabel-detail task %u library-at %#llx bytes %u stage %d fields %d reason [%s]\\n",
+                        task, (unsigned long long)at, h.len, stage, fields_changed, why);
             if (fields_changed <= 0) continue;
         }
         dispatch_data_t data = dispatch_data_create(try.bytes, try.length, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
         err = nil;
         library = [device newLibraryWithData:data error:&err];
+        if (library) loaded_at = stage;
         if (!library && !first_err) first_err = err;
         if (library && (stage != start_stage || (stage && first_err == nil && !getenv("HV_PVG_RELABEL_QUIET")))) {
             [self complain:[NSString stringWithFormat:@"library: loaded relabelled for iOS 17 (stage %d; as sent: %@)", stage,
@@ -525,9 +522,12 @@ static void hv_dump_failed_library(NSData *lib, uint32_t task, uint64_t function
         [self complain:[NSString stringWithFormat:@"library: %@", failure.localizedDescription]];
         return nil;
     }
-    {   /* m4 fork: while tracing, keep each library macOS sends, to read its shaders on a Mac */
-        const char *tf = getenv("HV_PVG_TRACE_FILE");
-        if (tf && getenv("HV_SHADER_DUMP") && atoi(getenv("HV_SHADER_DUMP"))) {
+    {   /* Keep source libraries for shader analysis. HV_SHADER_DUMP=0 disables the default sample. */
+        static int relabelled_kept = 0;
+        const char *tf = getenv("HV_PVG_TRACE_FILE"), *sd = getenv("HV_SHADER_DUMP");
+        int keep = sd ? atoi(sd) != 0 : loaded_at > 0 && relabelled_kept < 48;
+        if (keep && !sd) relabelled_kept++;
+        if (tf && keep) {
             NSString *dir = [[[NSString stringWithUTF8String:tf] stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"shaders"];
             [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
             NSString *name = [NSString stringWithFormat:@"%@-%llx.metallib", library.functionNames.firstObject ?: @"lib", (unsigned long long)at];
