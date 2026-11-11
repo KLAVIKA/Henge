@@ -7,7 +7,7 @@ import UIKit
 /// file once; this side decides when to save, and says which build and settings a file belongs to.
 enum InstantResume {
     static let key = "henge.instantResume"
-    static var enabled: Bool { (UserDefaults.standard.object(forKey: key) as? Bool) ?? true }
+    static var enabled: Bool { (UserDefaults.standard.object(forKey: key) as? Bool) ?? false }
 
     /// Saving and running on take turns on one queue, never on the main thread: a save takes a few seconds.
     private static let queue = DispatchQueue(label: "henge.instant-resume", qos: .userInitiated)
@@ -45,7 +45,7 @@ enum InstantResume {
     /// Henge stopped being active (the app switcher, a call, Control Center, going home): stop the Mac where it is
     /// while the GPU is still Henge's, so what only the GPU holds goes back into the Mac's memory.
     static func pause() {
-        guard enabled, henge_vm_state() == 1 else { return }
+        guard henge_vm_state() == 1 else { return }
         queue.async {
             var buffer = [CChar](repeating: 0, count: 256)
             if henge_vm_pause(&buffer, buffer.count) != 0 { HengeLog.log("resume", "not paused: \(String(cString: buffer))") }
