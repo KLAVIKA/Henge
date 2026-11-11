@@ -27,6 +27,9 @@ typedef struct HvVmConfig {
 
 /* Returns 0, or -1 with a reason in err. */
 int hv_vm_create(const HvVmConfig *cfg, char *err, size_t errlen);
+/* After CPUs stop, detach backends and release the old machine. Borrowed iOS
+   JIT memory stays owned by the app and can be attached to the next machine. */
+void hv_vm_destroy(void);
 HvMachine *hv_vm_machine(void);
 HvVmapple *hv_vm_board(void);
 HvCpu *hv_vm_cpu(int index);
@@ -53,7 +56,8 @@ void hv_vm_set_poll(void (*poll)(void));
    CPUs and the 1 ms kicker. on_exit is called on CPU 0's thread when the
    machine stops (powered off, a fatal error, or hv_vm_stop), after the disks
    are flushed; reason is an HV_EXIT_* value. */
-void hv_vm_start(int cpu0, void (*on_exit)(int reason));
+/* Returns -1 if a thread could not start; already-started workers are joined. */
+int hv_vm_start(int cpu0, void (*on_exit)(int reason));
 /* Call on a thread before it runs guest code (hv_vm_start's threads do): see vm.c. */
 void hv_vm_prepare_cpu_thread(void);
 /* That, and the scheduling class the guest's CPUs run at. */
@@ -62,7 +66,25 @@ void hv_vm_cpu_qos(void);
 int hv_vm_run_cpu0(void);
 /* Stop at the next block; the CPUs' threads end. */
 void hv_vm_stop(void);
+/* Instant resume (see snapshot.h). hv_vm_pause stops every CPU at a block boundary and quiets the devices (disk
+   requests finished, the GPU's own memory copied back into the guest's, sound stopped), keeping the machine whole:
+   0, or -1 if it stopped for good instead (shut down, or a CPU stopped it at the same moment). A machine whose CPU 0
+   the caller runs (hv_vm_start(0, ...)) calls hv_vm_finish_pause on that thread once hv_vm_run_cpu0 returns with
+   halted HV_HALT_SAVE. hv_vm_continue runs it on from where it stopped. */
+int hv_vm_pause(void);
+int hv_vm_finish_pause(void);
+int hv_vm_paused(void);
+int hv_vm_continue(void);
+int hv_vm_pause_clean(void); /* paused with no disk request in flight: it can be saved */
+uint64_t hv_vm_paused_counter(void); /* the guest's virtual counter when it paused */
+/* The counter to go on from after a pause or a restore made at wall_ns (CLOCK_REALTIME): see vm.c. */
+uint64_t hv_vm_resume_counter(uint64_t counter, int64_t wall_ns);
+int64_t hv_vm_paused_wall_ns(void);
+/* After a resume (or a long pause): the network link down for 2 s, 1.5 s from now. */
+void hv_vm_link_flap(void);
 void hv_vm_flush_disks(void);
+/* The disk and auxiliary storage files as they are now (inode, size, last change): a saved machine resumes only onto these. */
+int hv_vm_disk_identity(char *out, size_t n);
 const char *hv_vm_reason_name(int reason);
 
 /* Input from the host UI, any thread. Keys are Linux input codes (KEY_A = 30). */
@@ -72,16 +94,21 @@ void hv_vm_mouse_move(int dx, int dy);
 void hv_vm_mouse_button(int button, int down); /* 0 left, 1 right, 2 middle */
 void hv_vm_mouse_wheel(int dy);
 void hv_vm_mouse_hwheel(int dx);
-
-/* Diagnostic correlation: host input -> first guest PVG response (within 2 s). */
-void hv_vm_note_ui_input(void);
-void hv_vm_note_pointer_input(void);
-void hv_vm_note_ui_response(void);
-void hv_vm_note_pointer_response(void);
-void hv_vm_input_latency_dump(void);
+/* The Magic Trackpad 2 on the USB bus: a finger on it. phase: 0 down, 1 move, 2 up; id a
+   stable 1..15 per touch; x, y in sensor units (HV_TP_SENSOR_* in devices/xhci.h).
+   ts_ms is the touch sample's own clock in ms (see hv_xhci_touch). */
+void hv_vm_touch(int id, int phase, int x, int y, uint32_t ts_ms);
+void hv_vm_touch_frame(uint32_t ts_ms); /* commit one frame with every finger that moved */
+void hv_vm_touch_button(int down); /* the pad's full press (a click) */
 /* Where the guest has its pointer, in display pixels. 0, or -1 before it has one. */
 int hv_vm_pointer(int *x, int *y);
 /* A small picture of the display, BGRA, width * height * 4 bytes. 0, or -1 before anything shows. */
 int hv_vm_snapshot(uint8_t *bgra, int width, int height);
 
 #endif
+/* Input-to-response correlation metrics retained by the iOS 17 performance port. */
+void hv_vm_note_ui_input(void);
+void hv_vm_note_pointer_input(void);
+void hv_vm_note_ui_response(void);
+void hv_vm_note_pointer_response(void);
+void hv_vm_input_latency_dump(void);
