@@ -552,6 +552,7 @@ struct SessionView: View {
             return
         }
         var buffer = [CChar](repeating: 0, count: 256)
+        JITBootstrap.releaseLingeringDebugger()
         Sharing.prepare()
         EngineTuning.apply()
         henge_vm_set_display(UInt32(mac.screen.width), UInt32(mac.screen.height))
@@ -598,6 +599,7 @@ struct SessionView: View {
                 HengeLog.log("perf", "blocks/s \(String(format: "%.0f", blocksPerSecond)), GPU frames/10s \(gpuFrames &- lastGPUFrames), "
                              + "network tx \(framesOut), rx \(framesIn), thermal \(Self.thermalLabel(heat))")
                 lastGPUFrames = gpuFrames
+                JITBootstrap.releaseLingeringDebugger()
             }
             if tick == 60 && !stillWallpaperTipShown { // about when the desktop is up after a login
                 stillWallpaperTipShown = true
