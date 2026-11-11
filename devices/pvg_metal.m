@@ -499,7 +499,7 @@ static void hv_dump_failed_library(NSData *lib, uint32_t task, uint64_t function
             int fields_changed = hv_metallib_relabel(try.mutableBytes, try.length, stage, &why);
             static unsigned relabel_diagnostics;
             if (why && relabel_diagnostics++ < 64)
-                fprintf(stderr, "hengevm: pvg-metal: relabel-detail task %u library-at %#llx bytes %u stage %d fields %d reason [%s]\\n",
+                fprintf(stderr, "hengevm: pvg-metal: relabel-detail task %u library-at %#llx bytes %u stage %d fields %d reason [%s]\n",
                         task, (unsigned long long)at, h.len, stage, fields_changed, why);
             if (fields_changed <= 0) continue;
         }
