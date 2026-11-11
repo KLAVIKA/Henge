@@ -447,8 +447,7 @@ static int ijc_drop_va(HvCpu *cpu, uint64_t va, int asid, int remote) {
         uint32_t sl = (uint32_t)(va >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1);
         const HvTlbEntry *t1 = hv_tlb_ent(cpu, sl, 1), *t2 = hv_tlb_ent(cpu, sl, 2);
         int some = kernel ? t1->exec_tag == hv_exec_key(page, t1->addend) || t2->exec_tag == hv_exec_key(page, t2->addend) : asid < 0 || asid == current_asid(cpu) || current_asid(cpu) < 0;
-        if (some) {
-            if (!remote) ret_new(cpu, kernel);
+        if (some) {            if (!remote) ret_new(cpu, kernel);
             else if (!ret_new_remote(cpu, kernel)) return 0;
         }
     }
@@ -897,8 +896,7 @@ void hv_ijc_fill(HvCpu *cpu, HvBlock *b) {
     /* The filters below are per page: the next fill is mostly in the same one. */
     uint64_t pkey = (b->va & ~(uint64_t)PAGE_MASK) ^ cpu->ijc_salt[kernel] ^ 1;
     if (pcs->last_fill[kernel] == pkey) return;
-    if (!kernel) {
-        hv_ucode_add(cpu, b->va);
+    if (!kernel) {        hv_ucode_add(cpu, b->va);
         uint32_t h = (uint32_t)(b->va >> HV_TLB_PAGE_BITS) & 0xffff;
         pcs->ijc_pages[0][h >> 6] |= 1ull << (h & 63);
         uint32_t ch = (uint32_t)(b->va >> 25) & 255, cid = (uint32_t)(cpu->ijc_salt[0] >> 48); /* the id after any reset in ucode_add */
